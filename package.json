@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Standalone CLI downloader for Spotify CSVs and Monochrome playlists.",
+  "description": "Standalone CLI downloader for Spotify CSVs and Monochrome playlists, albums, tracks, and artists.",
   "bin": {
     "monochrome-playlist-downloader": "./index.mjs"
   },

@@ -3,6 +3,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const ANSI = {
@@ -31,6 +32,7 @@ const DEFAULT_QUALITY = 'HI_RES_LOSSLESS';
 const DEFAULT_FOLDER_TEMPLATE = '{albumTitle} - {albumArtist}';
 const DEFAULT_FILENAME_TEMPLATE = '{trackNumber} - {artist} - {title}';
 const CACHE_PATH = path.resolve(process.cwd(), '.cache', 'monochrome-playlist-downloader-cache.json');
+const DEFAULT_INSTANCE_RATE_LIMIT_COOLDOWN_MS = 3 * 60 * 1000;
 const TIDAL_BROWSER_CLIENT_ID = 'txNoH4kkV41MfH25';
 const TIDAL_BROWSER_CLIENT_SECRET = 'dQjy0MinCEvxi1O4UmxvxWnDjt4cgHBPw8ll6nYBk98=';
 
@@ -52,6 +54,7 @@ async function main() {
     const quality = args.quality || DEFAULT_QUALITY;
     const includeLyrics = !args['no-lyrics'];
     const createZip = !args['no-zip'];
+    const skipPlaybackPreflight = Boolean(args['i-know-it-doesnt-work-but-ill-use-it-anyway']);
     const cache = await PersistentCache.load(CACHE_PATH);
     let shuttingDown = false;
     let currentRunState = null;
@@ -80,11 +83,12 @@ async function main() {
 
     console.log(`Cache file: ${CACHE_PATH}`);
     console.log(
-        `Cache stats: search=${Object.keys(cache.data.searchTrack || {}).length}, metadata=${Object.keys(cache.data.trackMetadata || {}).length}, playlists=${Object.keys(cache.data.playlists || {}).length}, publicPlaylists=${Object.keys(cache.data.publicPlaylists || {}).length}, covers=${Object.keys(cache.data.covers || {}).length}`
+        `Cache stats: search=${Object.keys(cache.data.searchTrack || {}).length}, metadata=${Object.keys(cache.data.trackMetadata || {}).length}, playlists=${Object.keys(cache.data.playlists || {}).length}, publicPlaylists=${Object.keys(cache.data.publicPlaylists || {}).length}, albums=${Object.keys(cache.data.albums || {}).length}, albumContents=${Object.keys(cache.data.albumContents || {}).length}, albumMergeQueues=${Object.keys(cache.data.albumMergeQueues || {}).length}, artists=${Object.keys(cache.data.artists || {}).length}, covers=${Object.keys(cache.data.covers || {}).length}`
     );
 
     console.log(`Resolving source: ${sourceValue}`);
     const source = await resolveSource(sourceValue, client);
+    await cache.flush();
     const safeSourceName = sanitizeForFilename(source.title);
     const assemblyRoot = path.join(outputRoot, safeSourceName);
 
@@ -93,7 +97,13 @@ async function main() {
     console.log(`Source type: ${source.type}`);
     console.log(`Tracks discovered: ${source.tracks.length}`);
     if (source.missing?.length) {
-        console.log(`Unmatched CSV rows: ${source.missing.length}`);
+        console.log(`Source items skipped: ${source.missing.length}`);
+    }
+
+    if (skipPlaybackPreflight) {
+        console.log('Playback preflight bypassed by user flag.');
+    } else {
+        await runPlaybackPreflight(source, client);
     }
 
     const downloaded = [];
@@ -124,6 +134,18 @@ async function main() {
             const relativeAudioPath = path.posix.join(folderName, `${fileBase}.flac`);
             const absoluteAudioPath = path.join(assemblyRoot, ...relativeAudioPath.split('/'));
             await fs.mkdir(path.dirname(absoluteAudioPath), { recursive: true });
+
+            const existingAudioPath = await findExistingAudioPath(absoluteAudioPath);
+            if (existingAudioPath) {
+                const finalRelativeAudioPath = path.posix.join(folderName, path.basename(existingAudioPath));
+                console.log(`  -> file exists, skipping download: ${finalRelativeAudioPath}`);
+                downloaded.push({
+                    ...resolvedTrack,
+                    filePath: finalRelativeAudioPath,
+                });
+                await currentRunState.flush();
+                continue;
+            }
 
             const audioResult = await client.downloadTrackToFile(resolvedTrack.id, absoluteAudioPath);
             const finalRelativeAudioPath = path.posix.join(folderName, `${fileBase}.${audioResult.extension}`);
@@ -271,7 +293,7 @@ function installPrettyLogging() {
             return paint(line, ANSI.bold, ANSI.green);
         }
 
-        if (/^Cache file:|^Cache stats:|^Resolving source:|^Source type:|^Tracks discovered:|^Unmatched CSV rows:|^ZIP archive:/iu.test(line.trim())) {
+        if (/^Cache file:|^Cache stats:|^Resolving source:|^Source type:|^Tracks discovered:|^Source items skipped:|^ZIP archive:/iu.test(line.trim())) {
             return paint(line, ANSI.dim);
         }
 
@@ -338,6 +360,10 @@ class PersistentCache {
             trackMetadata: {},
             playlists: {},
             publicPlaylists: {},
+            albums: {},
+            albumContents: {},
+            albumMergeQueues: {},
+            artists: {},
             covers: {},
         };
 
@@ -432,44 +458,57 @@ function printHelp() {
 Monochrome playlist downloader
 
 Usage:
-  node index.mjs --input <csv-or-link> [--output <dir>]
+  node index.mjs --input <csv-json-or-link> [--output <dir>]
 
 Accepted input:
   - Spotify playlist/library CSV exports with track and artist columns
+  - Generated Monochrome collection JSON files (.json)
   - Monochrome playlist links: /playlist/{id}
   - Monochrome public user playlist links: /userplaylist/{id}
+  - Monochrome album links: /album/{id}
+  - Monochrome track links: /track/{id}
+  - Monochrome artist links: /artist/{id}
 
 Options:
-  --input <value>          CSV path or Monochrome playlist link
+  --input <value>          CSV/JSON path or Monochrome link
   --output <dir>           Output directory root. Default: ./downloads
   --api-url <url>          Override Monochrome/HiFi API base URL
   --pocketbase-url <url>   Override PocketBase URL for public user playlists
   --quality <token>        Default: HI_RES_LOSSLESS
   --no-lyrics              Skip .lrc lyric downloads
   --no-zip                 Skip ZIP archive creation
+  --i-know-it-doesnt-work-but-ill-use-it-anyway
+                           Skip the startup playback preflight
   --help                   Show this help
 `.trim());
 }
 
 async function resolveSource(input, client) {
     if (await exists(input)) {
-        if (path.extname(input).toLowerCase() !== '.csv') {
-            throw new Error('Only CSV files are supported for file input.');
+        const extension = path.extname(input).toLowerCase();
+        if (extension === '.csv') {
+            console.log(`Reading CSV: ${input}`);
+            const csvText = await fs.readFile(input, 'utf8');
+            const csvResult = await parseCsvSource(csvText, client);
+            return {
+                type: 'csv',
+                title: path.basename(input, path.extname(input)),
+                tracks: csvResult.tracks,
+                missing: csvResult.missing,
+                metadata: {
+                    title: path.basename(input, path.extname(input)),
+                    source: input,
+                },
+            };
         }
 
-        console.log(`Reading CSV: ${input}`);
-        const csvText = await fs.readFile(input, 'utf8');
-        const csvResult = await parseCsvSource(csvText, client);
-        return {
-            type: 'csv',
-            title: path.basename(input, path.extname(input)),
-            tracks: csvResult.tracks,
-            missing: csvResult.missing,
-            metadata: {
-                title: path.basename(input, path.extname(input)),
-                source: input,
-            },
-        };
+        if (extension === '.json') {
+            console.log(`Reading JSON: ${input}`);
+            const jsonText = await fs.readFile(input, 'utf8');
+            return await parseJsonSource(jsonText, input, client);
+        }
+
+        throw new Error('Only CSV and generated JSON files are supported for file input.');
     }
 
     const playlistMatch = input.match(/\/playlist\/([^/?#]+)/i);
@@ -498,7 +537,49 @@ async function resolveSource(input, client) {
         };
     }
 
-    throw new Error('Unsupported input. Use a CSV file or a Monochrome playlist link.');
+    const albumMatch = input.match(/\/album\/([^/?#]+)/i);
+    if (albumMatch) {
+        const albumId = albumMatch[1];
+        const album = await client.getAlbum(albumId);
+        return {
+            type: 'album',
+            title: album.album.title,
+            tracks: album.tracks,
+            missing: [],
+            metadata: album.album,
+        };
+    }
+
+    const trackMatch = input.match(/\/track\/([^/?#]+)/i);
+    if (trackMatch) {
+        const trackId = trackMatch[1];
+        const track = await client.getTrackMetadata(trackId);
+        return {
+            type: 'track',
+            title: `${getTrackArtists(track)} - ${getTrackTitle(track)}`,
+            tracks: [track],
+            missing: [],
+            metadata: {
+                ...track,
+                title: getTrackTitle(track),
+            },
+        };
+    }
+
+    const artistMatch = input.match(/\/artist\/([^/?#]+)/i);
+    if (artistMatch) {
+        const artistId = artistMatch[1];
+        const artist = await client.getArtistTracks(artistId);
+        return {
+            type: 'artist',
+            title: artist.artist.name,
+            tracks: artist.tracks,
+            missing: [],
+            metadata: artist.artist,
+        };
+    }
+
+    throw new Error('Unsupported input. Use a CSV/JSON file or a Monochrome album, track, artist, or playlist link.');
 }
 
 async function parseCsvSource(csvText, client) {
@@ -543,6 +624,152 @@ async function parseCsvSource(csvText, client) {
     }
 
     return { tracks, missing };
+}
+
+async function parseJsonSource(jsonText, filePath, client) {
+    let parsed;
+    try {
+        parsed = JSON.parse(jsonText);
+    } catch (error) {
+        throw new Error(`Invalid JSON file: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    if (!isGeneratedCollectionJson(parsed)) {
+        throw new Error('Unsupported JSON input. Expected a generated Monochrome collection JSON file.');
+    }
+
+    return await buildAlbumMergeSourceFromJson(parsed, filePath, jsonText, client);
+}
+
+async function buildAlbumMergeSourceFromJson(parsed, filePath, jsonText, client) {
+    const sourceTitle = parsed?.source?.title || path.basename(filePath, path.extname(filePath));
+    const sourceTracks = Array.isArray(parsed?.tracks) ? parsed.tracks : [];
+    const sourceFingerprint = createHash('sha1').update(jsonText).digest('hex');
+    const queueCacheKey = JSON.stringify({
+        filePath: path.resolve(filePath),
+        fingerprint: sourceFingerprint,
+        sourceType: parsed?.sourceType || null,
+        trackCount: sourceTracks.length,
+    });
+    const cachedQueue = client.cache.get('albumMergeQueues', queueCacheKey);
+
+    if (cachedQueue) {
+        console.log(`Album merge queue cache hit: ${sourceTitle}`);
+        return {
+            type: 'album-merge',
+            title: cachedQueue.title || `${sourceTitle} - Album Merge`,
+            tracks: Array.isArray(cachedQueue.tracks) ? cachedQueue.tracks : [],
+            missing: Array.isArray(cachedQueue.missing) ? cachedQueue.missing : [],
+            metadata: {
+                ...(cachedQueue.metadata || {}),
+                queueCacheKey,
+                sourceFingerprint,
+            },
+        };
+    }
+
+    const originalTrackIds = new Set(
+        sourceTracks
+            .map((track) => normalizeId(track?.id))
+            .filter(Boolean)
+    );
+    const seenAlbumIds = new Set();
+    const expandedTracks = [];
+    const missing = [];
+
+    console.log(`JSON tracks to expand: ${sourceTracks.length}`);
+
+    for (let index = 0; index < sourceTracks.length; index += 1) {
+        const seedTrack = sourceTracks[index];
+        const seedTrackId = normalizeId(seedTrack?.id);
+        const seedLabel = `${seedTrack?.artist || 'Unknown Artist'} - ${seedTrack?.title || 'Unknown Title'}`;
+        console.log(`[expand ${index + 1}/${sourceTracks.length}] ${seedLabel}`);
+
+        if (!seedTrackId) {
+            console.log('  -> skipped: missing track id');
+            missing.push({ title: seedTrack?.title || null, artist: seedTrack?.artist || null, reason: 'Missing track id' });
+            continue;
+        }
+
+        const albumId = await resolveTrackAlbumId(seedTrack, seedTrackId, client).catch((error) => {
+            missing.push({
+                id: seedTrackId,
+                title: seedTrack?.title || null,
+                artist: seedTrack?.artist || null,
+                reason: error instanceof Error ? error.message : String(error),
+            });
+            console.log(`  -> skipped: ${missing.at(-1).reason}`);
+            return null;
+        });
+
+        if (!albumId) {
+            continue;
+        }
+
+        if (seenAlbumIds.has(albumId)) {
+            console.log(`  -> album already expanded: ${albumId}`);
+            continue;
+        }
+
+        const album = await client.getAlbumContents(albumId).catch((error) => {
+            missing.push({
+                id: seedTrackId,
+                albumId,
+                title: seedTrack?.title || null,
+                artist: seedTrack?.artist || null,
+                reason: error instanceof Error ? error.message : String(error),
+            });
+            console.log(`  -> album expansion failed: ${missing.at(-1).reason}`);
+            return null;
+        });
+
+        if (!album) {
+            continue;
+        }
+
+        seenAlbumIds.add(albumId);
+
+        const filteredAlbumTracks = album.tracks.filter((track) => {
+            const trackId = normalizeId(track?.id);
+            return trackId && !originalTrackIds.has(trackId);
+        });
+
+        console.log(
+            `  -> album expanded: ${album.album.title || albumId} total=${album.tracks.length} queued=${filteredAlbumTracks.length}`
+        );
+
+        expandedTracks.push(...filteredAlbumTracks);
+    }
+
+    const dedupedTracks = dedupeTracksById(expandedTracks);
+    const result = {
+        type: 'album-merge',
+        title: `${sourceTitle} - Album Merge`,
+        tracks: dedupedTracks,
+        missing,
+        metadata: {
+            title: `${sourceTitle} - Album Merge`,
+            artist: parsed?.source?.artist || 'Various Artists',
+            id: parsed?.source?.id || null,
+            sourceFormat: parsed?.format || null,
+            sourceType: parsed?.sourceType || null,
+            sourcePath: filePath,
+            queueCacheKey,
+            sourceFingerprint,
+            originalTrackCount: sourceTracks.length,
+            originalAlbumCount: seenAlbumIds.size,
+            expandedTrackCount: dedupedTracks.length,
+        },
+    };
+
+    client.cache.set('albumMergeQueues', queueCacheKey, {
+        title: result.title,
+        tracks: result.tracks,
+        missing: result.missing,
+        metadata: result.metadata,
+    });
+
+    return result;
 }
 
 function parseCsv(text) {
@@ -606,6 +833,152 @@ function mapCsvHeaders(headers) {
 function getCsvValue(row, headerMap, key) {
     const index = headerMap[key];
     return index >= 0 ? (row[index] || '').trim() : '';
+}
+
+function isGeneratedCollectionJson(value) {
+    return Boolean(
+        value &&
+            typeof value === 'object' &&
+            ['monochrome-collection', 'monochrome-playlist'].includes(value.format) &&
+            Array.isArray(value.tracks)
+    );
+}
+
+function normalizeId(value) {
+    if (value == null || value === '') {
+        return null;
+    }
+    return String(value);
+}
+
+async function resolveTrackAlbumId(track, trackId, client) {
+    const directAlbumId = normalizeId(track?.albumId || track?.album?.id);
+    if (directAlbumId) {
+        return directAlbumId;
+    }
+
+    console.log(`  -> metadata fetch for album id: ${trackId}`);
+    const metadata = await client.getTrackMetadata(trackId);
+    const hydratedAlbumId = normalizeId(metadata?.album?.id);
+    if (!hydratedAlbumId) {
+        throw new Error(`Track ${trackId} did not include an album id`);
+    }
+    return hydratedAlbumId;
+}
+
+function dedupeTracksById(tracks) {
+    const seen = new Set();
+    const deduped = [];
+
+    for (const track of tracks) {
+        const trackId = normalizeId(track?.id);
+        if (!trackId || seen.has(trackId)) {
+            continue;
+        }
+        seen.add(trackId);
+        deduped.push(track);
+    }
+
+    return deduped;
+}
+
+async function runPlaybackPreflight(source, client) {
+    const sampleTracks = selectPreflightTracks(source?.tracks || [], 3);
+    if (sampleTracks.length < 2) {
+        return;
+    }
+
+    console.log(`Playback preflight: sampling ${sampleTracks.length} tracks`);
+    const failures = [];
+
+    for (const track of sampleTracks) {
+        try {
+            console.log(`  -> preflight track: ${track.id} ${getTrackArtists(track)} - ${getTrackTitle(track)}`);
+            await client.resolveTrackStream(track.id);
+            console.log('  -> preflight passed');
+            return;
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            failures.push({
+                id: track.id,
+                message,
+            });
+            console.log(`  -> preflight failed: ${message}`);
+        }
+    }
+
+    const authLikeFailures = failures.filter((failure) => isLikelyPlaybackAuthFailure(failure.message));
+    if (failures.length === sampleTracks.length && authLikeFailures.length === failures.length) {
+        throw new Error(
+            `Playback preflight failed for ${failures.length}/${sampleTracks.length} sampled tracks. Upstream playback access looks unavailable across all configured instances, so the run was stopped early.`
+        );
+    }
+}
+
+function selectPreflightTracks(tracks, limit) {
+    const selected = [];
+    const seen = new Set();
+
+    for (const track of tracks) {
+        const trackId = normalizeId(track?.id);
+        if (!trackId || seen.has(trackId)) {
+            continue;
+        }
+        seen.add(trackId);
+        selected.push(track);
+        if (selected.length >= limit) {
+            break;
+        }
+    }
+
+    return selected;
+}
+
+function isLikelyPlaybackAuthFailure(message) {
+    const value = String(message || '').toLowerCase();
+    return (
+        value.includes('403 forbidden') ||
+        value.includes('preview dash manifest detected') ||
+        value.includes('full_requires_subscription') ||
+        value.includes('presentation=preview') ||
+        value.includes('preview-only') ||
+        value.includes('could not resolve stream from /track or /trackmanifests')
+    );
+}
+
+function compactTrackForAlbumContents(track, albumFallback = null) {
+    const album = {
+        ...(albumFallback || {}),
+        ...(track?.album || {}),
+    };
+
+    return {
+        id: track?.id ?? null,
+        title: track?.title || track?.name || null,
+        version: track?.version || null,
+        artist: track?.artist?.name ? { id: track.artist.id ?? null, name: track.artist.name } : null,
+        artists: Array.isArray(track?.artists)
+            ? track.artists
+                  .filter((artist) => artist?.name)
+                  .map((artist) => ({ id: artist.id ?? null, name: artist.name }))
+            : [],
+        album: {
+            id: album?.id ?? null,
+            title: album?.title || album?.name || null,
+            cover: album?.cover ?? null,
+            numberOfTracks: album?.numberOfTracks ?? null,
+            numberOfTracksOnDisc: album?.numberOfTracksOnDisc ?? null,
+            totalDiscs: album?.totalDiscs ?? null,
+            releaseDate: album?.releaseDate ?? null,
+            artist: album?.artist?.name ? { id: album.artist.id ?? null, name: album.artist.name } : null,
+        },
+        trackNumber: track?.trackNumber ?? null,
+        volumeNumber: track?.volumeNumber ?? track?.discNumber ?? null,
+        duration: track?.duration ?? null,
+        isrc: track?.isrc ?? null,
+        audioQuality: track?.audioQuality ?? null,
+        explicit: Boolean(track?.explicit),
+    };
 }
 
 function sanitizeForFilename(value) {
@@ -696,6 +1069,214 @@ function findSearchSection(source, key, visited) {
     }
 
     return null;
+}
+
+function extractAlbumPayload(payload, albumId) {
+    const album = findFirstObject(payload, (value) => isAlbumLike(value) && String(value.id || '') === String(albumId))
+        || findFirstObject(payload, isAlbumLike);
+    const tracks =
+        pickBestTrackCollection(payload, ['tracks', 'items', 'albumTracks'])
+            .map((entry) => normalizeTrackEntry(entry, album))
+            .filter(isTrackLike);
+
+    if (!album) {
+        throw new Error(`Album ${albumId} not found`);
+    }
+
+    if (!tracks.length) {
+        throw new Error(`Album ${albumId} did not include any tracks`);
+    }
+
+    return {
+        album: {
+            ...album,
+            title: album.title || album.name || `Album ${albumId}`,
+        },
+        tracks,
+    };
+}
+
+function extractArtistPayload(payload, artistId) {
+    const artist = findFirstObject(payload, (value) => isArtistLike(value) && String(value.id || '') === String(artistId))
+        || findFirstObject(payload, isArtistLike)
+        || { id: artistId, name: `Artist ${artistId}` };
+    const tracks =
+        pickBestTrackCollection(payload, ['popularTracks', 'topTracks', 'tracks', 'items'])
+            .map((entry) => normalizeTrackEntry(entry))
+            .filter((track) => isTrackLike(track) && artistMatchesTrack(track, artist));
+
+    if (!tracks.length) {
+        throw new Error(`Artist ${artistId} did not include any downloadable tracks`);
+    }
+
+    return {
+        artist,
+        tracks,
+    };
+}
+
+function findFirstObject(source, predicate, visited = new Set()) {
+    if (!source || typeof source !== 'object') {
+        return null;
+    }
+
+    if (visited.has(source)) {
+        return null;
+    }
+    visited.add(source);
+
+    if (!Array.isArray(source) && predicate(source)) {
+        return source;
+    }
+
+    if (Array.isArray(source)) {
+        for (const entry of source) {
+            const found = findFirstObject(entry, predicate, visited);
+            if (found) {
+                return found;
+            }
+        }
+        return null;
+    }
+
+    for (const value of Object.values(source)) {
+        const found = findFirstObject(value, predicate, visited);
+        if (found) {
+            return found;
+        }
+    }
+
+    return null;
+}
+
+function pickBestTrackCollection(source, preferredKeys = []) {
+    const candidates = [];
+    collectTrackCollections(source, candidates, [], new Set());
+    if (!candidates.length) {
+        return [];
+    }
+
+    const preferred = preferredKeys.map((key) => key.toLowerCase());
+    candidates.sort((left, right) => scoreTrackCollection(right, preferred) - scoreTrackCollection(left, preferred));
+    return candidates[0]?.tracks || [];
+}
+
+function collectTrackCollections(source, results, pathParts, visited) {
+    if (!source || typeof source !== 'object') {
+        return;
+    }
+
+    if (visited.has(source)) {
+        return;
+    }
+    visited.add(source);
+
+    if (Array.isArray(source)) {
+        const normalizedTracks = source.map((entry) => normalizeTrackEntry(entry)).filter(isTrackLike);
+        if (normalizedTracks.length > 0 && normalizedTracks.length >= Math.ceil(source.length / 2)) {
+            results.push({
+                path: pathParts.join('.'),
+                tracks: source,
+                normalizedTracks,
+            });
+        }
+
+        source.forEach((entry, index) => {
+            collectTrackCollections(entry, results, [...pathParts, String(index)], visited);
+        });
+        return;
+    }
+
+    for (const [key, value] of Object.entries(source)) {
+        collectTrackCollections(value, results, [...pathParts, key], visited);
+    }
+}
+
+function scoreTrackCollection(candidate, preferredKeys) {
+    const pathText = candidate.path.toLowerCase();
+    let score = candidate.normalizedTracks.length * 10;
+
+    preferredKeys.forEach((key, index) => {
+        if (pathText.includes(key)) {
+            score += 100 - index * 10;
+        }
+    });
+
+    if (/popular|top/i.test(pathText)) {
+        score += 40;
+    }
+    if (/album/i.test(pathText)) {
+        score += 20;
+    }
+    if (/video|artist.*album|similar/i.test(pathText)) {
+        score -= 40;
+    }
+
+    return score;
+}
+
+function normalizeTrackEntry(entry, albumFallback = null) {
+    const track = entry?.item || entry?.track || entry;
+    if (!track || typeof track !== 'object') {
+        return track;
+    }
+
+    return {
+        ...track,
+        album: {
+            ...(albumFallback || {}),
+            ...(track.album || {}),
+        },
+    };
+}
+
+function isTrackLike(value) {
+    return Boolean(
+        value &&
+            typeof value === 'object' &&
+            value.id != null &&
+            !Array.isArray(value.tracks) &&
+            !('numberOfTracks' in value) &&
+            !('numberOfVolumes' in value) &&
+            (value.title || value.name) &&
+            (value.artist || value.artists) &&
+            (
+                value.duration != null ||
+                value.trackNumber != null ||
+                value.volumeNumber != null ||
+                value.discNumber != null ||
+                value.isrc != null ||
+                value.audioQuality != null ||
+                value.album != null
+            )
+    );
+}
+
+function isAlbumLike(value) {
+    return Boolean(
+        value &&
+            typeof value === 'object' &&
+            value.id != null &&
+            (value.title || value.name) &&
+            ('numberOfTracks' in value || 'numberOfVolumes' in value || 'cover' in value || Array.isArray(value.tracks))
+    );
+}
+
+function isArtistLike(value) {
+    return Boolean(value && typeof value === 'object' && value.id != null && typeof (value.name || value.title) === 'string');
+}
+
+function artistMatchesTrack(track, artist) {
+    const artistId = String(artist?.id || '');
+    if (!artistId) {
+        return true;
+    }
+
+    if (String(track?.artist?.id || '') === artistId) {
+        return true;
+    }
+
+    return Array.isArray(track?.artists) && track.artists.some((entry) => String(entry?.id || '') === artistId);
 }
 
 function scoreTrackMatch(item, trackName, artistName, albumName, isrc) {
@@ -911,8 +1492,8 @@ async function writeCollectionArtifacts(rootDir, source, tracks, failures) {
     const m3u = generateM3U(source.metadata, tracks);
     const m3u8 = generateM3U8(source.metadata, tracks);
     const cue = generateCUE(source.metadata, tracks);
-    const nfo = generateNFO(source.metadata, tracks, source.type.includes('playlist') ? 'playlist' : 'playlist');
-    const json = generateJSON(source.metadata, tracks, failures);
+    const nfo = generateNFO(source.metadata, tracks, source.type === 'album' ? 'album' : 'playlist');
+    const json = generateJSON(source, tracks, failures);
 
     await Promise.all([
         fs.writeFile(path.join(rootDir, `${sourceName}.m3u`), m3u, 'utf8'),
@@ -990,15 +1571,17 @@ function generateNFO(metadata, tracks, type) {
     return xml;
 }
 
-function generateJSON(metadata, tracks, failures) {
+function generateJSON(source, tracks, failures) {
+    const metadata = source?.metadata || {};
     return JSON.stringify(
         {
-            format: 'monochrome-playlist',
+            format: 'monochrome-collection',
             version: '1.0',
             generated: new Date().toISOString(),
-            playlist: {
+            sourceType: source?.type || 'playlist',
+            source: {
                 title: metadata?.title || 'Playlist',
-                artist: metadata?.artist?.name || metadata?.artist || 'Various Artists',
+                artist: metadata?.artist?.name || metadata?.artist || metadata?.name || 'Various Artists',
                 id: metadata?.id || metadata?.uuid || null,
             },
             tracks: tracks.map((track, index) => ({
@@ -1007,6 +1590,7 @@ function generateJSON(metadata, tracks, failures) {
                 title: getTrackTitle(track),
                 artist: getTrackArtists(track),
                 album: track.album?.title || null,
+                albumId: track.album?.id || null,
                 albumArtist: track.album?.artist?.name || null,
                 trackNumber: track.trackNumber || null,
                 duration: Math.round(track.duration || 0),
@@ -1136,6 +1720,24 @@ async function exists(target) {
     }
 }
 
+async function findExistingAudioPath(flacPath) {
+    const parsed = path.parse(flacPath);
+    const candidates = [
+        flacPath,
+        path.join(parsed.dir, `${parsed.name}.m4a`),
+        path.join(parsed.dir, `${parsed.name}.mp3`),
+        path.join(parsed.dir, `${parsed.name}.mp4`),
+    ];
+
+    for (const candidate of candidates) {
+        if (await exists(candidate)) {
+            return candidate;
+        }
+    }
+
+    return null;
+}
+
 class MonochromeClient {
     constructor({ apiBase, apiInstances, pocketbaseUrl, quality, cache }) {
         this.apiBase = apiBase;
@@ -1143,12 +1745,15 @@ class MonochromeClient {
         this.pocketbaseUrl = pocketbaseUrl;
         this.quality = quality;
         this.cache = cache;
+        this.instanceCooldownMs = Number(process.env.MONOCHROME_INSTANCE_COOLDOWN_MS || DEFAULT_INSTANCE_RATE_LIMIT_COOLDOWN_MS);
+        this.instanceEndpointCooldowns = new Map();
         this.tidalToken = null;
         this.tidalTokenExpiry = 0;
     }
 
     async request(relativePath, { type = 'api', raw = false } = {}) {
-        const instances = this.apiBase ? [this.apiBase] : this.apiInstances;
+        const endpointKey = this.getEndpointKey(relativePath);
+        const instances = this.getApiBasesForEndpoint(endpointKey);
         let lastError = null;
 
         for (const base of instances) {
@@ -1158,9 +1763,11 @@ class MonochromeClient {
                 const response = await fetch(url);
                 if (!response.ok) {
                     console.log(`[request:${type}] ${response.status} ${response.statusText}`);
+                    this.noteEndpointResponse(base, endpointKey, response.status);
                     lastError = new Error(`${response.status} ${response.statusText} for ${url}`);
                     continue;
                 }
+                this.noteEndpointResponse(base, endpointKey, response.status);
                 console.log(`[request:${type}] ok`);
                 return raw ? response : await response.json();
             } catch (error) {
@@ -1295,6 +1902,52 @@ class MonochromeClient {
         return result;
     }
 
+    async getAlbum(id) {
+        const cached = this.cache.get('albums', String(id));
+        if (cached) {
+            console.log(`Album cache hit: ${id}`);
+            return cached;
+        }
+
+        const payload = await this.request(`/album/?id=${encodeURIComponent(id)}`);
+        const result = extractAlbumPayload(payload.data || payload, id);
+        this.cache.set('albums', String(id), result);
+        this.cache.set('albumContents', String(id), {
+            album: compactTrackForAlbumContents({ album: result.album }).album,
+            tracks: result.tracks.map((track) => compactTrackForAlbumContents(track, result.album)),
+        });
+        return result;
+    }
+
+    async getAlbumContents(id) {
+        const cached = this.cache.get('albumContents', String(id));
+        if (cached) {
+            console.log(`Album contents cache hit: ${id}`);
+            return cached;
+        }
+
+        const album = await this.getAlbum(id);
+        const compact = {
+            album: compactTrackForAlbumContents({ album: album.album }).album,
+            tracks: album.tracks.map((track) => compactTrackForAlbumContents(track, album.album)),
+        };
+        this.cache.set('albumContents', String(id), compact);
+        return compact;
+    }
+
+    async getArtistTracks(id) {
+        const cached = this.cache.get('artists', String(id));
+        if (cached) {
+            console.log(`Artist cache hit: ${id}`);
+            return cached;
+        }
+
+        const payload = await this.request(`/artist/?id=${encodeURIComponent(id)}`);
+        const result = extractArtistPayload(payload.data || payload, id);
+        this.cache.set('artists', String(id), result);
+        return result;
+    }
+
     async getTrackMetadata(id) {
         const cached = this.cache.get('trackMetadata', String(id));
         if (cached) {
@@ -1355,31 +2008,101 @@ class MonochromeClient {
     }
 
     async resolveTrackStream(trackId) {
-        const byTrack = await this.tryTrackEndpointAcrossInstances(trackId).catch(() => null);
+        const diagnostics = [];
+
+        const byTrack = await this.tryTrackEndpointAcrossInstances(trackId).catch((error) => {
+            diagnostics.push(error instanceof Error ? error.message : String(error));
+            return null;
+        });
         if (byTrack) {
             return byTrack;
         }
 
-        const byManifest = await this.tryTrackManifestEndpointAcrossInstances(trackId).catch(() => null);
+        const byManifest = await this.tryTrackManifestEndpointAcrossInstances(trackId).catch((error) => {
+            diagnostics.push(error instanceof Error ? error.message : String(error));
+            return null;
+        });
         if (byManifest) {
             return byManifest;
         }
 
-        const directManifest = await this.tryDirectTidalTrackManifest(trackId).catch(() => null);
+        const directManifest = await this.tryDirectTidalTrackManifest(trackId).catch((error) => {
+            diagnostics.push(error instanceof Error ? error.message : String(error));
+            return null;
+        });
         if (directManifest) {
             console.log('  -> stream source: direct TIDAL trackManifests');
-            return await this.downloadFromResolvedUri(directManifest);
+            try {
+                return await this.downloadFromResolvedUri(directManifest);
+            } catch (error) {
+                diagnostics.push(error instanceof Error ? error.message : String(error));
+            }
+        } else {
+            diagnostics.push('Direct TIDAL manifest unavailable or preview-only');
         }
 
-        throw new Error('Could not resolve stream from /track or /trackManifests');
+        throw new Error(
+            `Could not resolve stream from /track or /trackManifests${diagnostics.length ? `: ${diagnostics.join(' | ')}` : ''}`
+        );
     }
 
     getApiBases() {
         return this.apiBase ? [this.apiBase] : this.apiInstances;
     }
 
+    getApiBasesForEndpoint(endpointKey) {
+        const now = Date.now();
+        const preferred = [];
+        const coolingDown = [];
+
+        for (const base of this.getApiBases()) {
+            const cooldownUntil = this.getEndpointCooldownUntil(base, endpointKey);
+            if (cooldownUntil > now) {
+                coolingDown.push({ base, cooldownUntil });
+            } else {
+                preferred.push(base);
+            }
+        }
+
+        if (coolingDown.length) {
+            const suffix = coolingDown
+                .map(({ base, cooldownUntil }) => `${base} (${Math.max(1, Math.ceil((cooldownUntil - now) / 1000))}s)`)
+                .join(', ');
+            console.log(`  -> endpoint cooldown ${endpointKey}: ${suffix}`);
+        }
+
+        coolingDown.sort((left, right) => left.cooldownUntil - right.cooldownUntil);
+        return [...preferred, ...coolingDown.map((entry) => entry.base)];
+    }
+
+    getEndpointKey(relativePath) {
+        const match = String(relativePath).match(/^\/([^/?#]+)/u);
+        return match ? `/${match[1].toLowerCase()}` : '/';
+    }
+
+    getEndpointCooldownUntil(base, endpointKey) {
+        return this.instanceEndpointCooldowns.get(`${String(base)}::${endpointKey}`) || 0;
+    }
+
+    noteEndpointResponse(base, endpointKey, status) {
+        const mapKey = `${String(base)}::${endpointKey}`;
+
+        if (status === 429) {
+            const cooldownUntil = Date.now() + this.instanceCooldownMs;
+            this.instanceEndpointCooldowns.set(mapKey, cooldownUntil);
+            console.log(
+                `  -> endpoint cooldown set: base=${base} endpoint=${endpointKey} ttl=${Math.ceil(this.instanceCooldownMs / 1000)}s`
+            );
+            return;
+        }
+
+        if (status >= 200 && status < 300) {
+            this.instanceEndpointCooldowns.delete(mapKey);
+        }
+    }
+
     async tryTrackEndpointAcrossInstances(trackId) {
-        const bases = this.getApiBases();
+        const bases = this.getApiBasesForEndpoint('/track');
         let lastError = null;
 
         for (const base of bases) {
@@ -1536,7 +2259,7 @@ class MonochromeClient {
     }
 
     async tryTrackManifestEndpointAcrossInstances(trackId) {
-        const bases = this.getApiBases();
+        const bases = this.getApiBasesForEndpoint('/trackmanifests');
         let lastError = null;
 
         for (const base of bases) {
@@ -1562,6 +2285,9 @@ class MonochromeClient {
                 );
 
                 if (String(trackPresentation).toUpperCase() === 'PREVIEW') {
+                    lastError = new Error(
+                        `Preview-only trackManifests response on ${base}${previewReason ? `: ${previewReason}` : ''}`
+                    );
                     console.log('  -> trackManifests candidate rejected, trying next instance');
                     continue;
                 }
@@ -1584,18 +2310,22 @@ class MonochromeClient {
             console.log(
                 `  -> trackManifests path unavailable: ${lastError instanceof Error ? lastError.message : String(lastError)}`
             );
+            throw lastError;
         }
-        return null;
+        throw new Error('trackManifests path unavailable');
     }
 
     async requestAgainstBase(base, relativePath) {
+        const endpointKey = this.getEndpointKey(relativePath);
         const url = `${String(base).replace(/\/$/u, '')}${relativePath}`;
         console.log(`[request:api] ${url}`);
         const response = await fetch(url);
         if (!response.ok) {
             console.log(`[request:api] ${response.status} ${response.statusText}`);
+            this.noteEndpointResponse(base, endpointKey, response.status);
             throw new Error(`${response.status} ${response.statusText} for ${url}`);
         }
+        this.noteEndpointResponse(base, endpointKey, response.status);
         console.log('[request:api] ok');
         return await response.json();
     }
