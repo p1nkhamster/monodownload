@@ -36,8 +36,6 @@ const DEFAULT_INSTANCE_RATE_LIMIT_COOLDOWN_MS = 3 * 60 * 1000;
 const TIDAL_BROWSER_CLIENT_ID = 'txNoH4kkV41MfH25';
 const TIDAL_BROWSER_CLIENT_SECRET = 'dQjy0MinCEvxi1O4UmxvxWnDjt4cgHBPw8ll6nYBk98=';
 
-installPrettyLogging();
-
 async function main() {
     const args = parseArgs(process.argv.slice(2));
 
@@ -87,7 +85,9 @@ async function main() {
     );
 
     console.log(`Resolving source: ${sourceValue}`);
-    const source = await resolveSource(sourceValue, client);
+    const source = await resolveSource(sourceValue, client, {
+        skipPlaybackPreflight,
+    });
     await cache.flush();
     const safeSourceName = sanitizeForFilename(source.title);
     const assemblyRoot = path.join(outputRoot, safeSourceName);
@@ -100,10 +100,12 @@ async function main() {
         console.log(`Source items skipped: ${source.missing.length}`);
     }
 
-    if (skipPlaybackPreflight) {
-        console.log('Playback preflight bypassed by user flag.');
-    } else {
-        await runPlaybackPreflight(source, client);
+    if (!source.metadata?.preflightCompleted) {
+        if (skipPlaybackPreflight) {
+            console.log('Playback preflight bypassed by user flag.');
+        } else {
+            await runPlaybackPreflight(source, client);
+        }
     }
 
     const downloaded = [];
@@ -222,11 +224,17 @@ async function main() {
 
 function installPrettyLogging() {
     const useColor = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
+    const rawArgv = process.argv.slice(2);
+    const forcePlain = rawArgv.includes('--plain') || rawArgv.includes('--no-ui');
+    const verbose = rawArgv.includes('--verbose');
+    const useDashboard = Boolean(process.stdout.isTTY) && !forcePlain && !verbose;
     const original = {
         log: console.log.bind(console),
         warn: console.warn.bind(console),
         error: console.error.bind(console),
     };
+    const dashboard = useDashboard ? new TtyDashboard({ useColor, output: process.stdout }) : null;
+    globalThis.__MONOCHROME_DASHBOARD__ = dashboard;
 
     const paint = (text, ...styles) => {
         if (!useColor) {
@@ -301,6 +309,11 @@ function installPrettyLogging() {
     };
 
     const wrap = (method) => (...args) => {
+        if (dashboard && args.length === 1 && typeof args[0] === 'string') {
+            dashboard.handleLine(method, args[0]);
+            return;
+        }
+
         if (args.length === 1 && typeof args[0] === 'string') {
             original[method](formatLine(args[0]));
             return;
@@ -317,6 +330,347 @@ function installPrettyLogging() {
     console.log = wrap('log');
     console.warn = wrap('warn');
     console.error = wrap('error');
+}
+
+class TtyDashboard {
+    constructor({ useColor, output }) {
+        this.useColor = useColor;
+        this.output = output;
+        this.events = [];
+        this.failures = [];
+        this.cooldowns = [];
+        this.active = false;
+        this.state = {
+            cacheFile: null,
+            cacheStats: null,
+            resolvingSource: null,
+            sourceType: null,
+            sourceTitle: null,
+            tracksDiscovered: null,
+            sourceItemsSkipped: 0,
+            expansion: null,
+            expansionQueued: null,
+            currentTrack: null,
+            playbackPreflight: null,
+            currentPhase: 'Starting',
+            downloaded: 0,
+            skipped: 0,
+            failed: 0,
+            zipArchive: null,
+            completed: null,
+            fatalError: null,
+        };
+        if (this.output.isTTY) {
+            this.active = true;
+            this.output.write('\x1b[?1049h');
+            this.output.write('\x1b[2J\x1b[H');
+            this.output.write('\x1b[?25l');
+        }
+        process.on('exit', () => {
+            this.stop(false);
+        });
+        this.render();
+    }
+
+    paint(text, ...styles) {
+        if (!this.useColor) {
+            return text;
+        }
+        return `${styles.join('')}${text}${ANSI.reset}`;
+    }
+
+    handleLine(method, line) {
+        const trimmed = String(line || '').trim();
+        if (!trimmed) {
+            return;
+        }
+
+        this.parseLine(method, trimmed);
+        this.render();
+    }
+
+    parseLine(method, line) {
+        if (line.startsWith('[request:')) {
+            return;
+        }
+
+        if (line.startsWith('Cache file:')) {
+            this.state.cacheFile = line.replace(/^Cache file:\s*/u, '');
+            return;
+        }
+
+        if (line.startsWith('Cache stats:')) {
+            this.state.cacheStats = line.replace(/^Cache stats:\s*/u, '');
+            return;
+        }
+
+        if (line.startsWith('Resolving source:')) {
+            this.state.resolvingSource = line.replace(/^Resolving source:\s*/u, '');
+            this.state.sourceTitle = this.state.resolvingSource;
+            this.state.currentPhase = 'Resolving source';
+            return;
+        }
+
+        if (line.startsWith('Source type:')) {
+            this.state.sourceType = line.replace(/^Source type:\s*/u, '');
+            return;
+        }
+
+        if (line.startsWith('Tracks discovered:')) {
+            this.state.tracksDiscovered = Number(line.replace(/^Tracks discovered:\s*/u, '')) || 0;
+            return;
+        }
+
+        if (line.startsWith('Source items skipped:')) {
+            this.state.sourceItemsSkipped = Number(line.replace(/^Source items skipped:\s*/u, '')) || 0;
+            return;
+        }
+
+        if (line.startsWith('JSON tracks to expand:')) {
+            this.state.currentPhase = 'Expanding albums';
+            this.state.expansion = {
+                current: 0,
+                total: Number(line.replace(/^JSON tracks to expand:\s*/u, '')) || 0,
+                currentLabel: null,
+            };
+            return;
+        }
+
+        const expandMatch = line.match(/^\[expand (\d+)\/(\d+)\]\s+(.*)$/u);
+        if (expandMatch) {
+            this.state.currentPhase = 'Expanding albums';
+            this.state.expansion = {
+                current: Number(expandMatch[1]),
+                total: Number(expandMatch[2]),
+                currentLabel: expandMatch[3],
+            };
+            return;
+        }
+
+        const queuedMatch = line.match(/^->\s+album expanded:\s+.*\s+total=(\d+)\s+queued=(\d+)$/u);
+        if (queuedMatch) {
+            this.state.expansionQueued = (this.state.expansionQueued || 0) + Number(queuedMatch[2] || 0);
+            return;
+        }
+
+        if (line.startsWith('Playback preflight:')) {
+            this.state.currentPhase = 'Playback preflight';
+            this.state.playbackPreflight = {
+                summary: line,
+                currentTrack: null,
+                passed: 0,
+                failed: 0,
+            };
+            return;
+        }
+
+        if (line.startsWith('-> preflight track:')) {
+            this.state.currentPhase = 'Playback preflight';
+            this.state.playbackPreflight = this.state.playbackPreflight || {};
+            this.state.playbackPreflight.currentTrack = line.replace(/^->\s+preflight track:\s*/u, '');
+            return;
+        }
+
+        if (line.startsWith('-> preflight passed')) {
+            this.state.playbackPreflight = this.state.playbackPreflight || {};
+            this.state.playbackPreflight.passed = (this.state.playbackPreflight.passed || 0) + 1;
+            this.pushEvent('Preflight passed');
+            return;
+        }
+
+        if (line.startsWith('-> preflight failed:')) {
+            this.state.playbackPreflight = this.state.playbackPreflight || {};
+            this.state.playbackPreflight.failed = (this.state.playbackPreflight.failed || 0) + 1;
+            this.pushFailure(line.replace(/^->\s+preflight failed:\s*/u, ''));
+            return;
+        }
+
+        const trackMatch = line.match(/^\[(\d+)\/(\d+)\]\s+(.*)$/u);
+        if (trackMatch) {
+            this.state.currentPhase = 'Downloading';
+            this.state.currentTrack = {
+                index: Number(trackMatch[1]),
+                total: Number(trackMatch[2]),
+                label: trackMatch[3],
+            };
+            this.state.downloaded = Math.max(
+                this.state.downloaded,
+                Math.max(0, Number(trackMatch[1]) - 1 - this.state.skipped - this.state.failed)
+            );
+            return;
+        }
+
+        if (line.startsWith('-> file exists, skipping download:')) {
+            this.state.skipped += 1;
+            this.pushEvent(line.replace(/^->\s+/u, ''));
+            return;
+        }
+
+        if (line.startsWith('Failed:') || line.startsWith('Failed:'.padStart(10))) {
+            this.state.failed += 1;
+            this.pushFailure(line.replace(/^Failed:\s*/u, '').replace(/^\s*Failed:\s*/u, ''));
+            return;
+        }
+
+        if (line.startsWith('Saved ') || line.includes('because the upstream stream was not FLAC')) {
+            this.pushEvent(line);
+            return;
+        }
+
+        if (line.startsWith('ZIP archive:')) {
+            this.state.zipArchive = line.replace(/^ZIP archive:\s*/u, '');
+            return;
+        }
+
+        if (line.startsWith('Completed:')) {
+            this.state.completed = line;
+            this.state.currentPhase = 'Completed';
+            return;
+        }
+
+        if (line.includes('endpoint cooldown')) {
+            this.cooldowns.unshift(line.replace(/^->\s+/u, ''));
+            this.cooldowns = this.cooldowns.slice(0, 4);
+            return;
+        }
+
+        if (method === 'warn' || method === 'error') {
+            this.state.fatalError = line;
+            this.pushFailure(line);
+            return;
+        }
+
+        this.pushEvent(line);
+    }
+
+    pushEvent(line) {
+        this.events.unshift(line.replace(/^->\s+/u, ''));
+        this.events = this.events.slice(0, 5);
+    }
+
+    pushFailure(line) {
+        this.failures.unshift(line);
+        this.failures = this.failures.slice(0, 5);
+    }
+
+    render() {
+        if (!this.active || !this.output.isTTY) {
+            return;
+        }
+
+        const lines = [];
+        lines.push(this.paint('Monochrome Downloader', ANSI.bold, ANSI.cyan));
+        lines.push(`Phase: ${this.state.currentPhase}`);
+        if (this.state.sourceType || this.state.tracksDiscovered != null) {
+            lines.push(
+                `Source: ${this.state.sourceType || 'unknown'}${this.state.tracksDiscovered != null ? ` | Tracks: ${this.state.tracksDiscovered}` : ''}${this.state.sourceItemsSkipped ? ` | Skipped source items: ${this.state.sourceItemsSkipped}` : ''}`
+            );
+        }
+
+        if (this.state.expansion) {
+            lines.push(
+                `Expansion: ${this.state.expansion.current}/${this.state.expansion.total}${this.state.expansionQueued != null ? ` | Queued: ${this.state.expansionQueued}` : ''}`
+            );
+            if (this.state.expansion.currentLabel) {
+                lines.push(`Album seed: ${truncate(this.state.expansion.currentLabel, 100)}`);
+            }
+        }
+
+        if (this.state.playbackPreflight) {
+            lines.push(
+                `Preflight: passed=${this.state.playbackPreflight.passed || 0} failed=${this.state.playbackPreflight.failed || 0}`
+            );
+            if (this.state.playbackPreflight.currentTrack) {
+                lines.push(`Preflight track: ${truncate(this.state.playbackPreflight.currentTrack, 100)}`);
+            }
+        }
+
+        if (this.state.currentTrack) {
+            lines.push(`Track: ${this.state.currentTrack.index}/${this.state.currentTrack.total}`);
+            lines.push(`Now: ${truncate(this.state.currentTrack.label, 100)}`);
+        }
+
+        lines.push(
+            `Progress: downloaded=${this.state.downloaded} skipped=${this.state.skipped} failed=${this.state.failed}`
+        );
+
+        if (this.cooldowns.length) {
+            lines.push(this.paint('Cooldowns', ANSI.bold, ANSI.yellow));
+            lines.push(...this.cooldowns.map((line) => `- ${truncate(line, 110)}`));
+        }
+
+        if (this.failures.length) {
+            lines.push(this.paint('Recent Failures', ANSI.bold, ANSI.red));
+            lines.push(...this.failures.map((line) => `- ${truncate(line, 110)}`));
+        }
+
+        if (this.events.length) {
+            lines.push(this.paint('Recent Events', ANSI.bold, ANSI.gray));
+            lines.push(...this.events.map((line) => `- ${truncate(line, 110)}`));
+        }
+
+        if (this.state.cacheStats) {
+            lines.push(this.paint('Cache', ANSI.bold, ANSI.blue));
+            lines.push(truncate(this.state.cacheStats, 110));
+        }
+
+        const body = lines.join('\n');
+        this.output.write('\x1b[2J\x1b[H');
+        this.output.write(`${body}\n`);
+    }
+
+    stop(keepCursorHidden = false) {
+        if (!this.active || !this.output.isTTY) {
+            return;
+        }
+        this.active = false;
+        if (!keepCursorHidden) {
+            this.output.write('\x1b[?25h');
+        }
+        this.output.write('\x1b[?1049l');
+    }
+
+    printFinalSummary() {
+        this.stop(false);
+        const lines = [];
+        lines.push(this.paint('Monochrome Downloader Summary', ANSI.bold, ANSI.cyan));
+        if (this.state.sourceType || this.state.sourceTitle) {
+            lines.push(
+                `Source: ${this.state.sourceType || 'unknown'}${this.state.sourceTitle ? ` | ${this.state.sourceTitle}` : ''}`
+            );
+        }
+        if (this.state.tracksDiscovered != null) {
+            lines.push(`Tracks discovered: ${this.state.tracksDiscovered}`);
+        }
+        lines.push(`Downloaded: ${this.state.downloaded}`);
+        lines.push(`Skipped existing: ${this.state.skipped}`);
+        lines.push(`Failed: ${this.state.failed}`);
+        if (this.state.expansionQueued != null) {
+            lines.push(`Album-merge queued tracks: ${this.state.expansionQueued}`);
+        }
+        if (this.state.zipArchive) {
+            lines.push(`ZIP archive: ${this.state.zipArchive}`);
+        }
+        if (this.state.completed) {
+            lines.push(this.paint(this.state.completed, ANSI.bold, ANSI.green));
+        }
+        if (this.state.fatalError) {
+            lines.push(this.paint(`Error: ${this.state.fatalError}`, ANSI.bold, ANSI.red));
+        }
+        if (this.failures.length) {
+            lines.push(this.paint('Recent failures:', ANSI.bold, ANSI.red));
+            lines.push(...this.failures.slice(0, 3).map((line) => `- ${truncate(line, 120)}`));
+        }
+        this.output.write(`${lines.join('\n')}\n`);
+    }
+}
+
+function truncate(value, maxLength) {
+    const text = String(value || '');
+    if (text.length <= maxLength) {
+        return text;
+    }
+    return `${text.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
 function parseArgs(argv) {
@@ -477,13 +831,15 @@ Options:
   --quality <token>        Default: HI_RES_LOSSLESS
   --no-lyrics              Skip .lrc lyric downloads
   --no-zip                 Skip ZIP archive creation
+  --plain                  Force line-by-line logs instead of the TTY dashboard
+  --verbose                Show raw request/resolver logs instead of the TTY dashboard
   --i-know-it-doesnt-work-but-ill-use-it-anyway
                            Skip the startup playback preflight
   --help                   Show this help
 `.trim());
 }
 
-async function resolveSource(input, client) {
+async function resolveSource(input, client, options = {}) {
     if (await exists(input)) {
         const extension = path.extname(input).toLowerCase();
         if (extension === '.csv') {
@@ -505,7 +861,7 @@ async function resolveSource(input, client) {
         if (extension === '.json') {
             console.log(`Reading JSON: ${input}`);
             const jsonText = await fs.readFile(input, 'utf8');
-            return await parseJsonSource(jsonText, input, client);
+            return await parseJsonSource(jsonText, input, client, options);
         }
 
         throw new Error('Only CSV and generated JSON files are supported for file input.');
@@ -626,7 +982,7 @@ async function parseCsvSource(csvText, client) {
     return { tracks, missing };
 }
 
-async function parseJsonSource(jsonText, filePath, client) {
+async function parseJsonSource(jsonText, filePath, client, options = {}) {
     let parsed;
     try {
         parsed = JSON.parse(jsonText);
@@ -638,7 +994,26 @@ async function parseJsonSource(jsonText, filePath, client) {
         throw new Error('Unsupported JSON input. Expected a generated Monochrome collection JSON file.');
     }
 
-    return await buildAlbumMergeSourceFromJson(parsed, filePath, jsonText, client);
+    if (options.skipPlaybackPreflight) {
+        console.log('Playback preflight bypassed by user flag.');
+    } else {
+        await runPlaybackPreflight(
+            {
+                type: 'playlist-json',
+                title: parsed?.source?.title || path.basename(filePath, path.extname(filePath)),
+                tracks: Array.isArray(parsed?.tracks) ? parsed.tracks : [],
+                missing: [],
+            },
+            client
+        );
+    }
+
+    const result = await buildAlbumMergeSourceFromJson(parsed, filePath, jsonText, client);
+    result.metadata = {
+        ...(result.metadata || {}),
+        preflightCompleted: !options.skipPlaybackPreflight,
+    };
+    return result;
 }
 
 async function buildAlbumMergeSourceFromJson(parsed, filePath, jsonText, client) {
@@ -2914,9 +3289,17 @@ async function streamToBuffer(result) {
     throw new Error('Expected a buffer result from stream download');
 }
 
+installPrettyLogging();
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-    main().catch((error) => {
-        console.error(error instanceof Error ? error.message : error);
-        process.exit(1);
-    });
+    main()
+        .then(() => {
+            globalThis.__MONOCHROME_DASHBOARD__?.printFinalSummary?.();
+        })
+        .catch((error) => {
+            globalThis.__MONOCHROME_DASHBOARD__?.handleLine('error', error instanceof Error ? error.message : String(error));
+            globalThis.__MONOCHROME_DASHBOARD__?.printFinalSummary?.();
+            console.error(error instanceof Error ? error.message : error);
+            process.exit(1);
+        });
 }

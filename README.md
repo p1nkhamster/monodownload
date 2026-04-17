@@ -47,6 +47,8 @@ node .\index.mjs --input "C:\Users\v\Downloads\liked.csv" --output "C:\Users\v\M
 --quality <token>        Default: HI_RES_LOSSLESS
 --no-lyrics              Skip .lrc lyric downloads
 --no-zip                 Skip ZIP archive creation
+--plain                  Force line-by-line logs instead of the TTY dashboard
+--verbose                Show raw request/resolver logs instead of the TTY dashboard
 --i-know-it-doesnt-work-but-ill-use-it-anyway
                          Skip the startup playback preflight
 --help                   Show help
@@ -56,5 +58,5 @@ node .\index.mjs --input "C:\Users\v\Downloads\liked.csv" --output "C:\Users\v\M
 
 - Cache is written to `.cache/monochrome-playlist-downloader-cache.json`
 - Output artifacts are written into the playlist folder, including `_run-state.json`
-- Logs are colorized and compacted when running in a TTY
+- A live TTY dashboard is used by default for interactive terminals; use `--plain` or `--verbose` to fall back to line-by-line logs
 - Passing a generated `.json` collection file expands each playlist track to its full album and downloads only the album tracks that were not already in the playlist, so the result can be merged back in later
