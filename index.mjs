@@ -20,10 +20,7 @@ const ANSI = {
 };
 
 const DEFAULT_API_INSTANCES = [
-    'https://tidal-api.binimum.org',
-    'https://api.monochrome.tf',
-    'https://monochrome-api.samidy.com',
-    'https://hifi.geeked.wtf',
+    'https://hifi.valerie.sh'
 ];
 
 const DEFAULT_POCKETBASE_URL = 'https://data.samidy.xyz';
@@ -39,9 +36,15 @@ const TIDAL_BROWSER_CLIENT_SECRET = 'dQjy0MinCEvxi1O4UmxvxWnDjt4cgHBPw8ll6nYBk98
 async function main() {
     const args = parseArgs(process.argv.slice(2));
 
-    if (args.help || !args.input) {
+    if (args.help) {
         printHelp();
-        process.exit(args.help ? 0 : 1);
+        return;
+    }
+
+    if (!args.input) {
+        printHelp();
+        process.exitCode = 1;
+        return;
     }
 
     const input = path.resolve(args.input);
@@ -339,6 +342,7 @@ class TtyDashboard {
         this.events = [];
         this.failures = [];
         this.cooldowns = [];
+        this.cooldownTimer = null;
         this.active = false;
         this.state = {
             cacheFile: null,
@@ -365,6 +369,12 @@ class TtyDashboard {
             this.output.write('\x1b[?1049h');
             this.output.write('\x1b[2J\x1b[H');
             this.output.write('\x1b[?25l');
+            this.cooldownTimer = setInterval(() => {
+                if (this.active) {
+                    this.render();
+                }
+            }, 1000);
+            this.cooldownTimer.unref?.();
         }
         process.on('exit', () => {
             this.stop(false);
@@ -528,9 +538,7 @@ class TtyDashboard {
             return;
         }
 
-        if (line.includes('endpoint cooldown')) {
-            this.cooldowns.unshift(line.replace(/^->\s+/u, ''));
-            this.cooldowns = this.cooldowns.slice(0, 4);
+        if (this.parseCooldownLine(line)) {
             return;
         }
 
@@ -551,6 +559,49 @@ class TtyDashboard {
     pushFailure(line) {
         this.failures.unshift(line);
         this.failures = this.failures.slice(0, 5);
+    }
+
+    parseCooldownLine(line) {
+        const setMatch = line.match(/^->\s+endpoint cooldown set:\s+base=(.+?)\s+endpoint=(.+?)\s+ttl=(\d+)s$/u);
+        if (setMatch) {
+            const [, base, endpoint, seconds] = setMatch;
+            this.setCooldown(base, endpoint, Number(seconds) * 1000);
+            return true;
+        }
+
+        const waitMatch = line.match(/^->\s+endpoint cooldown wait:\s+base=(.+?)\s+endpoint=(.+?)\s+remaining=(\d+)s$/u);
+        if (waitMatch) {
+            const [, base, endpoint, seconds] = waitMatch;
+            this.setCooldown(base, endpoint, Number(seconds) * 1000);
+            return true;
+        }
+
+        const clearMatch = line.match(/^->\s+endpoint cooldown cleared:\s+base=(.+?)\s+endpoint=(.+)$/u);
+        if (clearMatch) {
+            const [, base, endpoint] = clearMatch;
+            this.cooldowns = this.cooldowns.filter((entry) => entry.base !== base || entry.endpoint !== endpoint);
+            return true;
+        }
+
+        return false;
+    }
+
+    setCooldown(base, endpoint, durationMs) {
+        const now = Date.now();
+        const until = now + Math.max(1000, Number(durationMs) || 0);
+        const key = `${base}::${endpoint}`;
+        const existing = this.cooldowns.find((entry) => entry.key === key);
+
+        if (existing) {
+            existing.until = Math.max(existing.until, until);
+        } else {
+            this.cooldowns.unshift({ key, base, endpoint, until });
+        }
+
+        this.cooldowns = this.cooldowns
+            .filter((entry) => entry.until > now)
+            .sort((left, right) => left.until - right.until)
+            .slice(0, 4);
     }
 
     render() {
@@ -594,9 +645,19 @@ class TtyDashboard {
             `Progress: downloaded=${this.state.downloaded} skipped=${this.state.skipped} failed=${this.state.failed}`
         );
 
-        if (this.cooldowns.length) {
+        const activeCooldowns = this.cooldowns
+            .filter((entry) => entry.until > Date.now())
+            .sort((left, right) => left.until - right.until)
+            .slice(0, 4);
+        this.cooldowns = activeCooldowns;
+
+        if (activeCooldowns.length) {
             lines.push(this.paint('Cooldowns', ANSI.bold, ANSI.yellow));
-            lines.push(...this.cooldowns.map((line) => `- ${truncate(line, 110)}`));
+            lines.push(
+                ...activeCooldowns.map((entry) =>
+                    `- ${truncate(`${entry.endpoint} on ${entry.base} (${formatRemainingSeconds(entry.until)}s)`, 110)}`
+                )
+            );
         }
 
         if (this.failures.length) {
@@ -624,6 +685,10 @@ class TtyDashboard {
             return;
         }
         this.active = false;
+        if (this.cooldownTimer) {
+            clearInterval(this.cooldownTimer);
+            this.cooldownTimer = null;
+        }
         if (!keepCursorHidden) {
             this.output.write('\x1b[?25h');
         }
@@ -671,6 +736,39 @@ function truncate(value, maxLength) {
         return text;
     }
     return `${text.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => {
+        setTimeout(resolve, Math.max(0, Number(ms) || 0));
+    });
+}
+
+function formatRemainingSeconds(until) {
+    return Math.max(1, Math.ceil((Number(until) - Date.now()) / 1000));
+}
+
+function parseRetryAfterMs(value) {
+    if (value == null) {
+        return null;
+    }
+
+    const trimmed = String(value).trim();
+    if (!trimmed) {
+        return null;
+    }
+
+    const seconds = Number(trimmed);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+        return Math.max(1000, Math.ceil(seconds * 1000));
+    }
+
+    const dateMs = Date.parse(trimmed);
+    if (Number.isFinite(dateMs)) {
+        return Math.max(1000, dateMs - Date.now());
+    }
+
+    return null;
 }
 
 function parseArgs(argv) {
@@ -2128,26 +2226,29 @@ class MonochromeClient {
 
     async request(relativePath, { type = 'api', raw = false } = {}) {
         const endpointKey = this.getEndpointKey(relativePath);
-        const instances = this.getApiBasesForEndpoint(endpointKey);
         let lastError = null;
 
-        for (const base of instances) {
-            const url = `${base.replace(/\/$/u, '')}${relativePath}`;
-            try {
-                console.log(`[request:${type}] ${url}`);
-                const response = await fetch(url);
-                if (!response.ok) {
-                    console.log(`[request:${type}] ${response.status} ${response.statusText}`);
-                    this.noteEndpointResponse(base, endpointKey, response.status);
-                    lastError = new Error(`${response.status} ${response.statusText} for ${url}`);
-                    continue;
+        for (let pass = 0; pass < 2; pass += 1) {
+            const instances = await this.getApiBasesForEndpoint(endpointKey);
+
+            for (const base of instances) {
+                const url = `${base.replace(/\/$/u, '')}${relativePath}`;
+                try {
+                    console.log(`[request:${type}] ${url}`);
+                    const response = await fetch(url);
+                    if (!response.ok) {
+                        console.log(`[request:${type}] ${response.status} ${response.statusText}`);
+                        this.noteEndpointResponse(base, endpointKey, response.status, response.headers);
+                        lastError = new Error(`${response.status} ${response.statusText} for ${url}`);
+                        continue;
+                    }
+                    this.noteEndpointResponse(base, endpointKey, response.status, response.headers);
+                    console.log(`[request:${type}] ok`);
+                    return raw ? response : await response.json();
+                } catch (error) {
+                    console.log(`[request:${type}] failed: ${error instanceof Error ? error.message : String(error)}`);
+                    lastError = error;
                 }
-                this.noteEndpointResponse(base, endpointKey, response.status);
-                console.log(`[request:${type}] ok`);
-                return raw ? response : await response.json();
-            } catch (error) {
-                console.log(`[request:${type}] failed: ${error instanceof Error ? error.message : String(error)}`);
-                lastError = error;
             }
         }
 
@@ -2425,29 +2526,41 @@ class MonochromeClient {
         return this.apiBase ? [this.apiBase] : this.apiInstances;
     }
 
-    getApiBasesForEndpoint(endpointKey) {
-        const now = Date.now();
-        const preferred = [];
-        const coolingDown = [];
+    async getApiBasesForEndpoint(endpointKey) {
+        while (true) {
+            const now = Date.now();
+            const preferred = [];
+            const coolingDown = [];
 
-        for (const base of this.getApiBases()) {
-            const cooldownUntil = this.getEndpointCooldownUntil(base, endpointKey);
-            if (cooldownUntil > now) {
-                coolingDown.push({ base, cooldownUntil });
-            } else {
-                preferred.push(base);
+            for (const base of this.getApiBases()) {
+                const cooldownUntil = this.getEndpointCooldownUntil(base, endpointKey);
+                if (cooldownUntil > now) {
+                    coolingDown.push({ base, cooldownUntil });
+                } else {
+                    preferred.push(base);
+                }
             }
-        }
 
-        if (coolingDown.length) {
-            const suffix = coolingDown
-                .map(({ base, cooldownUntil }) => `${base} (${Math.max(1, Math.ceil((cooldownUntil - now) / 1000))}s)`)
-                .join(', ');
-            console.log(`  -> endpoint cooldown ${endpointKey}: ${suffix}`);
-        }
+            coolingDown.sort((left, right) => left.cooldownUntil - right.cooldownUntil);
 
-        coolingDown.sort((left, right) => left.cooldownUntil - right.cooldownUntil);
-        return [...preferred, ...coolingDown.map((entry) => entry.base)];
+            if (coolingDown.length) {
+                const suffix = coolingDown
+                    .map(({ base, cooldownUntil }) => `${base} (${formatRemainingSeconds(cooldownUntil)}s)`)
+                    .join(', ');
+                console.log(`  -> endpoint cooldown ${endpointKey}: ${suffix}`);
+            }
+
+            if (preferred.length || !coolingDown.length) {
+                return [...preferred, ...coolingDown.map((entry) => entry.base)];
+            }
+
+            const nextReady = coolingDown[0];
+            const waitMs = Math.max(250, nextReady.cooldownUntil - Date.now());
+            console.log(
+                `  -> endpoint cooldown wait: base=${nextReady.base} endpoint=${endpointKey} remaining=${formatRemainingSeconds(nextReady.cooldownUntil)}s`
+            );
+            await sleep(waitMs);
+        }
     }
 
     getEndpointKey(relativePath) {
@@ -2459,25 +2572,28 @@ class MonochromeClient {
         return this.instanceEndpointCooldowns.get(`${String(base)}::${endpointKey}`) || 0;
     }
 
-    noteEndpointResponse(base, endpointKey, status) {
+    noteEndpointResponse(base, endpointKey, status, headers = null) {
         const mapKey = `${String(base)}::${endpointKey}`;
 
         if (status === 429) {
-            const cooldownUntil = Date.now() + this.instanceCooldownMs;
+            const retryAfterMs = parseRetryAfterMs(headers?.get?.('retry-after'));
+            const cooldownUntil = Date.now() + (retryAfterMs ?? this.instanceCooldownMs);
             this.instanceEndpointCooldowns.set(mapKey, cooldownUntil);
             console.log(
-                `  -> endpoint cooldown set: base=${base} endpoint=${endpointKey} ttl=${Math.ceil(this.instanceCooldownMs / 1000)}s`
+                `  -> endpoint cooldown set: base=${base} endpoint=${endpointKey} ttl=${formatRemainingSeconds(cooldownUntil)}s`
             );
             return;
         }
 
         if (status >= 200 && status < 300) {
-            this.instanceEndpointCooldowns.delete(mapKey);
+            if (this.instanceEndpointCooldowns.delete(mapKey)) {
+                console.log(`  -> endpoint cooldown cleared: base=${base} endpoint=${endpointKey}`);
+            }
         }
     }
 
     async tryTrackEndpointAcrossInstances(trackId) {
-        const bases = this.getApiBasesForEndpoint('/track');
+        const bases = await this.getApiBasesForEndpoint('/track');
         let lastError = null;
 
         for (const base of bases) {
@@ -2634,7 +2750,7 @@ class MonochromeClient {
     }
 
     async tryTrackManifestEndpointAcrossInstances(trackId) {
-        const bases = this.getApiBasesForEndpoint('/trackmanifests');
+        const bases = await this.getApiBasesForEndpoint('/trackmanifests');
         let lastError = null;
 
         for (const base of bases) {
@@ -2697,10 +2813,10 @@ class MonochromeClient {
         const response = await fetch(url);
         if (!response.ok) {
             console.log(`[request:api] ${response.status} ${response.statusText}`);
-            this.noteEndpointResponse(base, endpointKey, response.status);
+            this.noteEndpointResponse(base, endpointKey, response.status, response.headers);
             throw new Error(`${response.status} ${response.statusText} for ${url}`);
         }
-        this.noteEndpointResponse(base, endpointKey, response.status);
+        this.noteEndpointResponse(base, endpointKey, response.status, response.headers);
         console.log('[request:api] ok');
         return await response.json();
     }
