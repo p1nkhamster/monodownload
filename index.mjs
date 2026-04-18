@@ -962,7 +962,7 @@ async function resolveSource(input, client, options = {}) {
             return await parseJsonSource(jsonText, input, client, options);
         }
 
-        throw new Error('Only CSV and generated JSON files are supported for file input.');
+        throw new Error('Only CSV and supported JSON files are supported for file input.');
     }
 
     const playlistMatch = input.match(/\/playlist\/([^/?#]+)/i);
@@ -1088,30 +1088,34 @@ async function parseJsonSource(jsonText, filePath, client, options = {}) {
         throw new Error(`Invalid JSON file: ${error instanceof Error ? error.message : String(error)}`);
     }
 
-    if (!isGeneratedCollectionJson(parsed)) {
-        throw new Error('Unsupported JSON input. Expected a generated Monochrome collection JSON file.');
+    if (isGeneratedCollectionJson(parsed)) {
+        if (options.skipPlaybackPreflight) {
+            console.log('Playback preflight bypassed by user flag.');
+        } else {
+            await runPlaybackPreflight(
+                {
+                    type: 'playlist-json',
+                    title: parsed?.source?.title || path.basename(filePath, path.extname(filePath)),
+                    tracks: Array.isArray(parsed?.tracks) ? parsed.tracks : [],
+                    missing: [],
+                },
+                client
+            );
+        }
+
+        const result = await buildAlbumMergeSourceFromJson(parsed, filePath, jsonText, client);
+        result.metadata = {
+            ...(result.metadata || {}),
+            preflightCompleted: !options.skipPlaybackPreflight,
+        };
+        return result;
     }
 
-    if (options.skipPlaybackPreflight) {
-        console.log('Playback preflight bypassed by user flag.');
-    } else {
-        await runPlaybackPreflight(
-            {
-                type: 'playlist-json',
-                title: parsed?.source?.title || path.basename(filePath, path.extname(filePath)),
-                tracks: Array.isArray(parsed?.tracks) ? parsed.tracks : [],
-                missing: [],
-            },
-            client
-        );
+    if (isMonochromePlaylistJson(parsed)) {
+        return parseMonochromePlaylistJsonSource(parsed, filePath);
     }
 
-    const result = await buildAlbumMergeSourceFromJson(parsed, filePath, jsonText, client);
-    result.metadata = {
-        ...(result.metadata || {}),
-        preflightCompleted: !options.skipPlaybackPreflight,
-    };
-    return result;
+    throw new Error('Unsupported JSON input. Expected a generated Monochrome collection JSON file or a Monochrome playlist export.');
 }
 
 async function buildAlbumMergeSourceFromJson(parsed, filePath, jsonText, client) {
@@ -1315,6 +1319,83 @@ function isGeneratedCollectionJson(value) {
             ['monochrome-collection', 'monochrome-playlist'].includes(value.format) &&
             Array.isArray(value.tracks)
     );
+}
+
+function isMonochromePlaylistJson(value) {
+    return Boolean(
+        value &&
+            typeof value === 'object' &&
+            typeof (value.name || value.title) === 'string' &&
+            Array.isArray(value.tracks) &&
+            (value.id != null || value.uuid != null) &&
+            ('isPublic' in value || 'createdAt' in value || 'updatedAt' in value)
+    );
+}
+
+function parseMonochromePlaylistJsonSource(parsed, filePath) {
+    const title = parsed?.name || parsed?.title || path.basename(filePath, path.extname(filePath));
+    const tracks = Array.isArray(parsed?.tracks) ? parsed.tracks.map(normalizeMonochromePlaylistTrack) : [];
+
+    return {
+        type: 'playlist',
+        title,
+        tracks,
+        missing: [],
+        metadata: {
+            ...parsed,
+            title,
+            id: parsed?.id ?? parsed?.uuid ?? null,
+        },
+    };
+}
+
+function normalizeMonochromePlaylistTrack(track) {
+    const artists = Array.isArray(track?.artists)
+        ? track.artists
+              .filter((artist) => artist && typeof artist === 'object' && artist.name)
+              .map((artist) => ({
+                  id: artist.id ?? null,
+                  name: artist.name,
+              }))
+        : [];
+    const primaryArtist =
+        track?.artist && typeof track.artist === 'object' && track.artist.name
+            ? {
+                  ...track.artist,
+                  id: track.artist.id ?? null,
+              }
+            : artists[0]
+              ? {
+                    id: artists[0].id ?? null,
+                    name: artists[0].name,
+                }
+              : null;
+
+    return {
+        ...track,
+        id: track?.id ?? null,
+        title: track?.title || track?.name || null,
+        artist: primaryArtist,
+        artists,
+        album: {
+            ...(track?.album || {}),
+            id: track?.album?.id ?? null,
+            title: track?.album?.title || track?.album?.name || null,
+            cover: track?.album?.cover ?? null,
+            artist:
+                track?.album?.artist && typeof track.album.artist === 'object' && track.album.artist.name
+                    ? {
+                          ...track.album.artist,
+                          id: track.album.artist.id ?? null,
+                      }
+                    : null,
+        },
+        duration: track?.duration ?? null,
+        trackNumber: track?.trackNumber ?? null,
+        volumeNumber: track?.volumeNumber ?? track?.discNumber ?? null,
+        explicit: Boolean(track?.explicit),
+        isrc: track?.isrc ?? null,
+    };
 }
 
 function normalizeId(value) {
