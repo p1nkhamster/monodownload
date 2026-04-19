@@ -1583,11 +1583,26 @@ function getTrackTitle(track) {
     return track?.version ? `${track.title} (${track.version})` : track?.title || 'Unknown Title';
 }
 
+function getPrimaryTrackArtist(track) {
+    if (track?.artist?.name) {
+        return track.artist.name;
+    }
+
+    if (Array.isArray(track?.artists)) {
+        const firstNamedArtist = track.artists.find((artist) => artist?.name);
+        if (firstNamedArtist?.name) {
+            return firstNamedArtist.name;
+        }
+    }
+
+    return 'Unknown Artist';
+}
+
 function getTrackArtists(track) {
     if (Array.isArray(track?.artists) && track.artists.length > 0) {
         return track.artists.map((artist) => artist?.name || 'Unknown Artist').join(', ');
     }
-    return track?.artist?.name || 'Unknown Artist';
+    return getPrimaryTrackArtist(track);
 }
 
 function mergeTrackMetadata(primary, fallback) {
@@ -1966,7 +1981,9 @@ async function embedMetadataWithFfmpeg({ audioPath, track, lyrics, coverBuffer }
 
 function buildMetadataArgs(track, lyrics) {
     const metadata = new Map();
-    const albumArtist = track?.album?.artist?.name || track?.artist?.name || getTrackArtists(track);
+    // HiFi /info can return an album artist that does not match what TIDAL presents.
+    // For tags, use the primary track artist instead of the joined credits list or bad album artist.
+    const albumArtist = getPrimaryTrackArtist(track);
 
     metadata.set('title', getTrackTitle(track));
     metadata.set('artist', getTrackArtists(track));
