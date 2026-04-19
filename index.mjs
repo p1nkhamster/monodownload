@@ -26,6 +26,7 @@ const DEFAULT_API_INSTANCES = [
 const DEFAULT_POCKETBASE_URL = 'https://data.samidy.xyz';
 const DEFAULT_OUTPUT_ROOT = path.resolve(process.cwd(), 'downloads');
 const DEFAULT_QUALITY = 'HI_RES_LOSSLESS';
+const DEFAULT_DOWNLOAD_RETRIES = 2;
 const DEFAULT_FOLDER_TEMPLATE = '{albumTitle} - {albumArtist}';
 const DEFAULT_FILENAME_TEMPLATE = '{trackNumber} - {artist} - {title}';
 const CACHE_PATH = path.resolve(process.cwd(), '.cache', 'monochrome-playlist-downloader-cache.json');
@@ -55,6 +56,7 @@ async function main() {
     const quality = args.quality || DEFAULT_QUALITY;
     const includeLyrics = !args['no-lyrics'];
     const createZip = !args['no-zip'];
+    const downloadRetries = parseNonNegativeInteger(args['download-retries'], DEFAULT_DOWNLOAD_RETRIES);
     const skipPlaybackPreflight = Boolean(args['i-know-it-doesnt-work-but-ill-use-it-anyway']);
     const cache = await PersistentCache.load(CACHE_PATH);
     let shuttingDown = false;
@@ -116,97 +118,58 @@ async function main() {
     currentRunState = new RunState(assemblyRoot, source, downloaded, failures);
     await currentRunState.flush();
 
-    for (let index = 0; index < source.tracks.length; index += 1) {
-        const track = source.tracks[index];
-        const displayTitle = `${getTrackArtists(track)} - ${getTrackTitle(track)}`;
-        const trackLabel = `[${index + 1}/${source.tracks.length}] ${displayTitle}`;
-        console.log(trackLabel);
+    let queue = source.tracks.map((track) => ({ track, retryCount: 0 }));
 
-        try {
-            const hydratedTrack = await client.getTrackMetadata(track.id).catch(() => track);
-            const resolvedTrack = mergeTrackMetadata(track, hydratedTrack);
-            const folderName = formatTemplate(DEFAULT_FOLDER_TEMPLATE, {
-                albumTitle: resolvedTrack.album?.title,
-                albumArtist: resolvedTrack.album?.artist?.name || resolvedTrack.artist?.name,
-            });
-            const fileBase = formatTemplate(DEFAULT_FILENAME_TEMPLATE, {
-                trackNumber: resolvedTrack.trackNumber,
-                artist: resolvedTrack.artist?.name || resolvedTrack.artists?.[0]?.name,
-                title: getTrackTitle(resolvedTrack),
-            });
+    while (queue.length > 0) {
+        const nextQueue = [];
 
-            const albumDir = await resolvePreferredDirectory(assemblyRoot, folderName);
-            const actualFolderName = path.basename(albumDir);
-            const relativeAudioPath = path.posix.join(actualFolderName, `${fileBase}.flac`);
-            const absoluteAudioPath = path.join(albumDir, `${fileBase}.flac`);
-
-            const existingAudioPath = await findExistingAudioPath(absoluteAudioPath);
-            if (existingAudioPath) {
-                const finalRelativeAudioPath = path.posix.join(actualFolderName, path.basename(existingAudioPath));
-                console.log(`  -> file exists, skipping download: ${finalRelativeAudioPath}`);
-                downloaded.push({
-                    ...resolvedTrack,
-                    filePath: finalRelativeAudioPath,
-                });
-                await currentRunState.flush();
-                continue;
-            }
-
-            const audioResult = await client.downloadTrackToFile(resolvedTrack.id, absoluteAudioPath);
-            const finalRelativeAudioPath = path.posix.join(actualFolderName, `${fileBase}.${audioResult.extension}`);
-            let finalAbsoluteAudioPath = absoluteAudioPath;
-
-            if (audioResult.extension !== 'flac') {
-                finalAbsoluteAudioPath = absoluteAudioPath.replace(/\.flac$/i, `.${audioResult.extension}`);
-                await fs.rename(absoluteAudioPath, finalAbsoluteAudioPath);
-                console.warn(
-                    `  Saved ${resolvedTrack.id} as .${audioResult.extension} because the upstream stream was not FLAC.`
-                );
-            }
-
-            let embeddedLyrics = null;
-            if (includeLyrics) {
-                embeddedLyrics = await fetchLyrics(resolvedTrack);
-                if (embeddedLyrics) {
-                    const lrcPath = finalAbsoluteAudioPath.replace(/\.[^.]+$/u, '.lrc');
-                    await fs.writeFile(lrcPath, embeddedLyrics, 'utf8');
-                }
-            }
-
-            let coverBuffer = null;
-            const coverId = resolvedTrack.album?.cover;
-            if (coverId) {
-                const coverFolder = path.dirname(finalAbsoluteAudioPath);
-                const coverTarget = path.join(coverFolder, 'cover.jpg');
-                coverBuffer = await client.fetchCover(coverId);
-                if (coverBuffer && !albumCoverWrites.has(coverTarget)) {
-                    await fs.writeFile(coverTarget, coverBuffer);
-                    albumCoverWrites.add(coverTarget);
-                }
-            }
-
-            await embedMetadataWithFfmpeg({
-                audioPath: finalAbsoluteAudioPath,
-                track: resolvedTrack,
-                lyrics: embeddedLyrics,
-                coverBuffer,
-            });
-
-            downloaded.push({
-                ...resolvedTrack,
-                filePath: finalRelativeAudioPath,
-            });
-            await currentRunState.flush();
-        } catch (error) {
-            failures.push({
-                id: track.id,
-                title: getTrackTitle(track),
-                artist: getTrackArtists(track),
-                error: error instanceof Error ? error.message : String(error),
-            });
-            console.warn(`  Failed: ${failures.at(-1).error}`);
-            await currentRunState.flush();
+        if (queue[0]?.retryCount > 0) {
+            console.log(`Retry pass ${queue[0].retryCount}/${downloadRetries}: ${queue.length} track(s) requeued`);
         }
+
+        for (let index = 0; index < queue.length; index += 1) {
+            const { track, retryCount } = queue[index];
+            const displayTitle = `${getTrackArtists(track)} - ${getTrackTitle(track)}`;
+            const trackLabel =
+                retryCount > 0
+                    ? `[retry ${retryCount}/${downloadRetries}] ${displayTitle}`
+                    : `[${index + 1}/${source.tracks.length}] ${displayTitle}`;
+            console.log(trackLabel);
+
+            try {
+                const downloadedTrack = await downloadTrack({
+                    track,
+                    assemblyRoot,
+                    client,
+                    includeLyrics,
+                    albumCoverWrites,
+                });
+                downloaded.push(downloadedTrack);
+                await currentRunState.flush();
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+
+                if (retryCount < downloadRetries && isRetryableDownloadError(message)) {
+                    console.warn(`  Retry queued (${retryCount + 1}/${downloadRetries}): ${message}`);
+                    nextQueue.push({
+                        track,
+                        retryCount: retryCount + 1,
+                    });
+                } else {
+                    failures.push({
+                        id: track.id,
+                        title: getTrackTitle(track),
+                        artist: getTrackArtists(track),
+                        error: message,
+                    });
+                    console.warn(`  Failed: ${failures.at(-1).error}`);
+                }
+
+                await currentRunState.flush();
+            }
+        }
+
+        queue = nextQueue;
     }
 
     await writeCollectionArtifacts(assemblyRoot, source, downloaded, failures);
@@ -215,8 +178,12 @@ async function main() {
 
     if (createZip) {
         const zipPath = `${assemblyRoot}.zip`;
-        await zipFolder(assemblyRoot, zipPath);
-        console.log(`ZIP archive: ${zipPath}`);
+        if (process.platform === 'win32') {
+            await zipFolder(assemblyRoot, zipPath);
+            console.log(`ZIP archive: ${zipPath}`);
+        } else {
+            console.log('ZIP archive skipped: Compress-Archive is only implemented on Windows.');
+        }
     }
 
     console.log(`Completed: ${downloaded.length} succeeded, ${failures.length} failed.`);
@@ -798,6 +765,11 @@ function parseArgs(argv) {
     return args;
 }
 
+function parseNonNegativeInteger(value, fallback) {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 class PersistentCache {
     constructor(filePath, data) {
         this.filePath = filePath;
@@ -927,6 +899,7 @@ Options:
   --api-url <url>          Override Monochrome/HiFi API base URL
   --pocketbase-url <url>   Override PocketBase URL for public user playlists
   --quality <token>        Default: HI_RES_LOSSLESS
+  --download-retries <n>   Retry transient track download failures this many times. Default: 2
   --no-lyrics              Skip .lrc lyric downloads
   --no-zip                 Skip ZIP archive creation
   --plain                  Force line-by-line logs instead of the TTY dashboard
@@ -1583,6 +1556,78 @@ function getTrackTitle(track) {
     return track?.version ? `${track.title} (${track.version})` : track?.title || 'Unknown Title';
 }
 
+async function downloadTrack({ track, assemblyRoot, client, includeLyrics, albumCoverWrites }) {
+    const hydratedTrack = await client.getTrackMetadata(track.id).catch(() => track);
+    const resolvedTrack = mergeTrackMetadata(track, hydratedTrack);
+    const folderName = formatTemplate(DEFAULT_FOLDER_TEMPLATE, {
+        albumTitle: resolvedTrack.album?.title,
+        albumArtist: resolvedTrack.album?.artist?.name || resolvedTrack.artist?.name,
+    });
+    const fileBase = formatTemplate(DEFAULT_FILENAME_TEMPLATE, {
+        trackNumber: resolvedTrack.trackNumber,
+        artist: resolvedTrack.artist?.name || resolvedTrack.artists?.[0]?.name,
+        title: getTrackTitle(resolvedTrack),
+    });
+
+    const albumDir = await resolvePreferredDirectory(assemblyRoot, folderName);
+    const actualFolderName = path.basename(albumDir);
+    const relativeAudioPath = path.posix.join(actualFolderName, `${fileBase}.flac`);
+    const absoluteAudioPath = path.join(albumDir, `${fileBase}.flac`);
+
+    const existingAudioPath = await findExistingAudioPath(absoluteAudioPath);
+    if (existingAudioPath) {
+        const finalRelativeAudioPath = path.posix.join(actualFolderName, path.basename(existingAudioPath));
+        console.log(`  -> file exists, skipping download: ${finalRelativeAudioPath}`);
+        return {
+            ...resolvedTrack,
+            filePath: finalRelativeAudioPath,
+        };
+    }
+
+    const audioResult = await client.downloadTrackToFile(resolvedTrack.id, absoluteAudioPath);
+    const finalRelativeAudioPath = path.posix.join(actualFolderName, `${fileBase}.${audioResult.extension}`);
+    let finalAbsoluteAudioPath = absoluteAudioPath;
+
+    if (audioResult.extension !== 'flac') {
+        finalAbsoluteAudioPath = absoluteAudioPath.replace(/\.flac$/i, `.${audioResult.extension}`);
+        await fs.rename(absoluteAudioPath, finalAbsoluteAudioPath);
+        console.warn(`  Saved ${resolvedTrack.id} as .${audioResult.extension} because the upstream stream was not FLAC.`);
+    }
+
+    let embeddedLyrics = null;
+    if (includeLyrics) {
+        embeddedLyrics = await fetchLyrics(resolvedTrack);
+        if (embeddedLyrics) {
+            const lrcPath = finalAbsoluteAudioPath.replace(/\.[^.]+$/u, '.lrc');
+            await fs.writeFile(lrcPath, embeddedLyrics, 'utf8');
+        }
+    }
+
+    let coverBuffer = null;
+    const coverId = resolvedTrack.album?.cover;
+    if (coverId) {
+        const coverFolder = path.dirname(finalAbsoluteAudioPath);
+        const coverTarget = path.join(coverFolder, 'cover.jpg');
+        coverBuffer = await client.fetchCover(coverId);
+        if (coverBuffer && !albumCoverWrites.has(coverTarget)) {
+            await fs.writeFile(coverTarget, coverBuffer);
+            albumCoverWrites.add(coverTarget);
+        }
+    }
+
+    await embedMetadataWithFfmpeg({
+        audioPath: finalAbsoluteAudioPath,
+        track: resolvedTrack,
+        lyrics: embeddedLyrics,
+        coverBuffer,
+    });
+
+    return {
+        ...resolvedTrack,
+        filePath: finalRelativeAudioPath,
+    };
+}
+
 function getPrimaryTrackArtist(track) {
     if (track?.artist?.name) {
         return track.artist.name;
@@ -1603,6 +1648,23 @@ function getTrackArtists(track) {
         return track.artists.map((artist) => artist?.name || 'Unknown Artist').join(', ');
     }
     return getPrimaryTrackArtist(track);
+}
+
+function isRetryableDownloadError(message) {
+    const value = String(message || '').toLowerCase();
+    return (
+        value.includes('429 too many requests') ||
+        value.includes('rate limit') ||
+        value.includes('timed out') ||
+        value.includes('timeout') ||
+        value.includes('econnreset') ||
+        value.includes('econnrefused') ||
+        value.includes('eai_again') ||
+        value.includes('enotfound') ||
+        value.includes('network') ||
+        value.includes('fetch failed') ||
+        /\b5\d\d\b/u.test(value)
+    );
 }
 
 function mergeTrackMetadata(primary, fallback) {
