@@ -56,6 +56,7 @@ async function main() {
     const quality = args.quality || DEFAULT_QUALITY;
     const includeLyrics = !args['no-lyrics'];
     const createZip = !args['no-zip'];
+    const artistFolders = Boolean(args['artist-folders']);
     const downloadRetries = parseNonNegativeInteger(args['download-retries'], DEFAULT_DOWNLOAD_RETRIES);
     const skipPlaybackPreflight = Boolean(args['i-know-it-doesnt-work-but-ill-use-it-anyway']);
     const cache = await PersistentCache.load(CACHE_PATH);
@@ -94,9 +95,32 @@ async function main() {
         skipPlaybackPreflight,
     });
     await cache.flush();
-    const safeSourceName = sanitizeForFilename(source.title);
     await fs.mkdir(outputRoot, { recursive: true });
-    const assemblyRoot = await resolvePreferredDirectory(outputRoot, safeSourceName);
+
+    let assemblyRoot;
+    let flatAlbumDir = false;
+    let albumOnlyFolder = false;
+
+    if (artistFolders && (source.type === 'album' || source.type === 'track')) {
+        const artistName = sanitizeForFilename(
+            source.metadata?.artist?.name ||
+            source.metadata?.artists?.[0]?.name ||
+            'Unknown Artist'
+        );
+        const albumTitle = sanitizeForFilename(
+            source.type === 'album' ? source.title : (source.metadata?.album?.title || source.title)
+        );
+        const artistDir = await resolvePreferredDirectory(outputRoot, artistName);
+        assemblyRoot = await resolvePreferredDirectory(artistDir, albumTitle);
+        flatAlbumDir = true;
+    } else if (artistFolders && source.type === 'artist') {
+        const safeSourceName = sanitizeForFilename(source.title);
+        assemblyRoot = await resolvePreferredDirectory(outputRoot, safeSourceName);
+        albumOnlyFolder = true;
+    } else {
+        const safeSourceName = sanitizeForFilename(source.title);
+        assemblyRoot = await resolvePreferredDirectory(outputRoot, safeSourceName);
+    }
 
     console.log(`Source type: ${source.type}`);
     console.log(`Tracks discovered: ${source.tracks.length}`);
@@ -143,6 +167,8 @@ async function main() {
                     client,
                     includeLyrics,
                     albumCoverWrites,
+                    flatAlbumDir,
+                    albumOnlyFolder,
                 });
                 downloaded.push(downloadedTrack);
                 await currentRunState.flush();
@@ -902,6 +928,8 @@ Options:
   --download-retries <n>   Retry transient track download failures this many times. Default: 2
   --no-lyrics              Skip .lrc lyric downloads
   --no-zip                 Skip ZIP archive creation
+  --artist-folders         Save as {artist}/{album}/tracks instead of {source}/{album-artist}/tracks.
+                           Applies to album, track, and artist sources only.
   --plain                  Force line-by-line logs instead of the TTY dashboard
   --verbose                Show raw request/resolver logs instead of the TTY dashboard
   --i-know-it-doesnt-work-but-ill-use-it-anyway
@@ -1556,27 +1584,39 @@ function getTrackTitle(track) {
     return track?.version ? `${track.title} (${track.version})` : track?.title || 'Unknown Title';
 }
 
-async function downloadTrack({ track, assemblyRoot, client, includeLyrics, albumCoverWrites }) {
+async function downloadTrack({ track, assemblyRoot, client, includeLyrics, albumCoverWrites, flatAlbumDir = false, albumOnlyFolder = false }) {
     const hydratedTrack = await client.getTrackMetadata(track.id).catch(() => track);
     const resolvedTrack = mergeTrackMetadata(track, hydratedTrack);
-    const folderName = formatTemplate(DEFAULT_FOLDER_TEMPLATE, {
-        albumTitle: resolvedTrack.album?.title,
-        albumArtist: resolvedTrack.album?.artist?.name || resolvedTrack.artist?.name,
-    });
     const fileBase = formatTemplate(DEFAULT_FILENAME_TEMPLATE, {
         trackNumber: resolvedTrack.trackNumber,
         artist: resolvedTrack.artist?.name || resolvedTrack.artists?.[0]?.name,
         title: getTrackTitle(resolvedTrack),
     });
 
-    const albumDir = await resolvePreferredDirectory(assemblyRoot, folderName);
-    const actualFolderName = path.basename(albumDir);
-    const relativeAudioPath = path.posix.join(actualFolderName, `${fileBase}.flac`);
+    let albumDir;
+    let relativeAudioPath;
+    if (flatAlbumDir) {
+        albumDir = assemblyRoot;
+        relativeAudioPath = `${fileBase}.flac`;
+    } else {
+        const folderName = albumOnlyFolder
+            ? sanitizeForFilename(resolvedTrack.album?.title || 'Unknown Album')
+            : formatTemplate(DEFAULT_FOLDER_TEMPLATE, {
+                  albumTitle: resolvedTrack.album?.title,
+                  albumArtist: resolvedTrack.album?.artist?.name || resolvedTrack.artist?.name,
+              });
+        albumDir = await resolvePreferredDirectory(assemblyRoot, folderName);
+        const actualFolderName = path.basename(albumDir);
+        relativeAudioPath = path.posix.join(actualFolderName, `${fileBase}.flac`);
+    }
+
     const absoluteAudioPath = path.join(albumDir, `${fileBase}.flac`);
 
     const existingAudioPath = await findExistingAudioPath(absoluteAudioPath);
     if (existingAudioPath) {
-        const finalRelativeAudioPath = path.posix.join(actualFolderName, path.basename(existingAudioPath));
+        const finalRelativeAudioPath = flatAlbumDir
+            ? path.basename(existingAudioPath)
+            : path.posix.join(path.basename(albumDir), path.basename(existingAudioPath));
         console.log(`  -> file exists, skipping download: ${finalRelativeAudioPath}`);
         return {
             ...resolvedTrack,
@@ -1585,7 +1625,9 @@ async function downloadTrack({ track, assemblyRoot, client, includeLyrics, album
     }
 
     const audioResult = await client.downloadTrackToFile(resolvedTrack.id, absoluteAudioPath);
-    const finalRelativeAudioPath = path.posix.join(actualFolderName, `${fileBase}.${audioResult.extension}`);
+    const finalRelativeAudioPath = flatAlbumDir
+        ? `${fileBase}.${audioResult.extension}`
+        : path.posix.join(path.basename(albumDir), `${fileBase}.${audioResult.extension}`);
     let finalAbsoluteAudioPath = absoluteAudioPath;
 
     if (audioResult.extension !== 'flac') {
