@@ -1547,8 +1547,7 @@ function sanitizeForFilename(value) {
         .replace(/[. ]+$/gu, '')
         .trim();
 
-    // Some broken metadata arrives as box-drawing / technical-symbol mojibake.
-    // When that pattern shows up, fall back to a stricter Latin-safe filename.
+    // unicode ew
     if (/[\u2300-\u23ff\u2500-\u259f\u25a0-\u25ff]/u.test(original)) {
         sanitized = sanitized
             .replace(/[^A-Za-z0-9\s._()[\]&,'!+-]/g, ' ')
