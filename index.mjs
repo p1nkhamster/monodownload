@@ -20,7 +20,7 @@ const ANSI = {
 };
 
 const DEFAULT_API_INSTANCES = [
-    'https://hifi.valerie.sh'
+    'http://192.168.8.14:8000/'
 ];
 
 const DEFAULT_POCKETBASE_URL = 'https://data.samidy.xyz';
@@ -2682,7 +2682,7 @@ class MonochromeClient {
             return cached;
         }
 
-        const payload = await this.request(`/artist/?id=${encodeURIComponent(id)}`);
+        const payload = await this.request(`/artist/?f=${encodeURIComponent(id)}`);
         const result = extractArtistPayload(payload.data || payload, id);
         this.cache.set('artists', String(id), result);
         return result;
