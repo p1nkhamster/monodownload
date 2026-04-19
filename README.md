@@ -47,6 +47,10 @@ node .\index.mjs --input "C:\Users\v\Downloads\liked.csv" --output "C:\Users\v\M
 --quality <token>        Default: HI_RES_LOSSLESS
 --no-lyrics              Skip .lrc lyric downloads
 --no-zip                 Skip ZIP archive creation
+--artist-folders         Use {artist}/{album}/tracks layout instead of the default
+                         {source}/{album-artist}/tracks layout. Only applies to
+                         album, track, and artist sources. Ignored for playlists
+                         and CSV exports.
 --plain                  Force line-by-line logs instead of the TTY dashboard
 --verbose                Show raw request/resolver logs instead of the TTY dashboard
 --i-know-it-doesnt-work-but-ill-use-it-anyway
