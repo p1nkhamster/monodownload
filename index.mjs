@@ -1536,19 +1536,47 @@ function compactTrackForAlbumContents(track, albumFallback = null) {
 }
 
 function sanitizeForFilename(value) {
+<<<<<<< HEAD
     const sanitized = (value || 'Unknown')
         .replace(/[\u0000-\u001f]/gu, '')
+=======
+    const original = String(value || 'Unknown');
+    let sanitized = original
+        .normalize('NFKC')
+        .replace(/[\u0000-\u001f\u007f-\u009f]/gu, '')
+        .replace(/\p{Cf}+/gu, '')
+>>>>>>> e523638 (name sanitization fix)
         .replace(/[\\/:*?"<>|]/gu, '_')
+        .replace(/[^\p{L}\p{N}\p{M}\s._()[\]&,'!+-]/gu, ' ')
         .replace(/\s+/gu, ' ')
+<<<<<<< HEAD
         .trim()
         .replace(/^[.\s]+|[.\s]+$/gu, '');
+=======
+        .replace(/[. ]+$/gu, '')
+        .trim();
+
+    // Some broken metadata arrives as box-drawing / technical-symbol mojibake.
+    // When that pattern shows up, fall back to a stricter Latin-safe filename.
+    if (/[\u2300-\u23ff\u2500-\u259f\u25a0-\u25ff]/u.test(original)) {
+        sanitized = sanitized
+            .replace(/[^A-Za-z0-9\s._()[\]&,'!+-]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .replace(/[. ]+$/g, '')
+            .trim();
+    }
+>>>>>>> e523638 (name sanitization fix)
 
     if (!sanitized) {
         return 'Unknown';
     }
 
     if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/iu.test(sanitized)) {
+<<<<<<< HEAD
         return `_${sanitized}`;
+=======
+        return `${sanitized}_`;
+>>>>>>> e523638 (name sanitization fix)
     }
 
     return sanitized;
@@ -2002,7 +2030,13 @@ function buildComment(track) {
 }
 
 function sanitizeMetadataValue(value) {
-    return String(value).replace(/\0/gu, '').trim();
+    return String(value)
+        .normalize('NFKC')
+        .replace(/\0/gu, '')
+        .replace(/[\u0001-\u001f\u007f-\u009f]/gu, ' ')
+        .replace(/\p{Cf}+/gu, '')
+        .replace(/\s+/gu, ' ')
+        .trim();
 }
 
 function detectImageExtension(buffer) {
