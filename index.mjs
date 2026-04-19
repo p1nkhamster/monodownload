@@ -1455,10 +1455,22 @@ function compactTrackForAlbumContents(track, albumFallback = null) {
 }
 
 function sanitizeForFilename(value) {
-    return (value || 'Unknown')
+    const sanitized = (value || 'Unknown')
+        .replace(/[\u0000-\u001f]/gu, '')
         .replace(/[\\/:*?"<>|]/gu, '_')
         .replace(/\s+/gu, ' ')
-        .trim();
+        .trim()
+        .replace(/^[.\s]+|[.\s]+$/gu, '');
+
+    if (!sanitized) {
+        return 'Unknown';
+    }
+
+    if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/iu.test(sanitized)) {
+        return `_${sanitized}`;
+    }
+
+    return sanitized;
 }
 
 function formatTemplate(template, values) {
