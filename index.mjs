@@ -1536,23 +1536,14 @@ function compactTrackForAlbumContents(track, albumFallback = null) {
 }
 
 function sanitizeForFilename(value) {
-<<<<<<< HEAD
-    const sanitized = (value || 'Unknown')
-        .replace(/[\u0000-\u001f]/gu, '')
-=======
     const original = String(value || 'Unknown');
     let sanitized = original
         .normalize('NFKC')
         .replace(/[\u0000-\u001f\u007f-\u009f]/gu, '')
         .replace(/\p{Cf}+/gu, '')
->>>>>>> e523638 (name sanitization fix)
         .replace(/[\\/:*?"<>|]/gu, '_')
         .replace(/[^\p{L}\p{N}\p{M}\s._()[\]&,'!+-]/gu, ' ')
         .replace(/\s+/gu, ' ')
-<<<<<<< HEAD
-        .trim()
-        .replace(/^[.\s]+|[.\s]+$/gu, '');
-=======
         .replace(/[. ]+$/gu, '')
         .trim();
 
@@ -1565,18 +1556,13 @@ function sanitizeForFilename(value) {
             .replace(/[. ]+$/g, '')
             .trim();
     }
->>>>>>> e523638 (name sanitization fix)
 
     if (!sanitized) {
         return 'Unknown';
     }
 
     if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/iu.test(sanitized)) {
-<<<<<<< HEAD
-        return `_${sanitized}`;
-=======
         return `${sanitized}_`;
->>>>>>> e523638 (name sanitization fix)
     }
 
     return sanitized;
