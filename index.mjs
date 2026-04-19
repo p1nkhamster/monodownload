@@ -93,9 +93,8 @@ async function main() {
     });
     await cache.flush();
     const safeSourceName = sanitizeForFilename(source.title);
-    const assemblyRoot = path.join(outputRoot, safeSourceName);
-
-    await fs.mkdir(assemblyRoot, { recursive: true });
+    await fs.mkdir(outputRoot, { recursive: true });
+    const assemblyRoot = await resolvePreferredDirectory(outputRoot, safeSourceName);
 
     console.log(`Source type: ${source.type}`);
     console.log(`Tracks discovered: ${source.tracks.length}`);
@@ -136,13 +135,14 @@ async function main() {
                 title: getTrackTitle(resolvedTrack),
             });
 
-            const relativeAudioPath = path.posix.join(folderName, `${fileBase}.flac`);
-            const absoluteAudioPath = path.join(assemblyRoot, ...relativeAudioPath.split('/'));
-            await fs.mkdir(path.dirname(absoluteAudioPath), { recursive: true });
+            const albumDir = await resolvePreferredDirectory(assemblyRoot, folderName);
+            const actualFolderName = path.basename(albumDir);
+            const relativeAudioPath = path.posix.join(actualFolderName, `${fileBase}.flac`);
+            const absoluteAudioPath = path.join(albumDir, `${fileBase}.flac`);
 
             const existingAudioPath = await findExistingAudioPath(absoluteAudioPath);
             if (existingAudioPath) {
-                const finalRelativeAudioPath = path.posix.join(folderName, path.basename(existingAudioPath));
+                const finalRelativeAudioPath = path.posix.join(actualFolderName, path.basename(existingAudioPath));
                 console.log(`  -> file exists, skipping download: ${finalRelativeAudioPath}`);
                 downloaded.push({
                     ...resolvedTrack,
@@ -153,7 +153,7 @@ async function main() {
             }
 
             const audioResult = await client.downloadTrackToFile(resolvedTrack.id, absoluteAudioPath);
-            const finalRelativeAudioPath = path.posix.join(folderName, `${fileBase}.${audioResult.extension}`);
+            const finalRelativeAudioPath = path.posix.join(actualFolderName, `${fileBase}.${audioResult.extension}`);
             let finalAbsoluteAudioPath = absoluteAudioPath;
 
             if (audioResult.extension !== 'flac') {
@@ -2321,6 +2321,37 @@ async function findExistingAudioPath(flacPath) {
     }
 
     return null;
+}
+
+function normalizeEquivalentPathSegment(value) {
+    return String(value || '')
+        .normalize('NFKC')
+        .replace(/[\u0000-\u001f\u007f-\u009f]/gu, '')
+        .replace(/\p{Cf}+/gu, '')
+        .replace(/\s+/gu, ' ')
+        .trim()
+        .replace(/[. ]+$/gu, '')
+        .toLowerCase();
+}
+
+async function resolvePreferredDirectory(parentDir, preferredName) {
+    const normalizedPreferred = normalizeEquivalentPathSegment(preferredName);
+
+    try {
+        const entries = await fs.readdir(parentDir, { withFileTypes: true });
+        const existing = entries.find(
+            (entry) => entry.isDirectory() && normalizeEquivalentPathSegment(entry.name) === normalizedPreferred
+        );
+        if (existing) {
+            return path.join(parentDir, existing.name);
+        }
+    } catch {
+        // Parent may not exist yet; fall back to creating the preferred path.
+    }
+
+    const target = path.join(parentDir, preferredName);
+    await fs.mkdir(target, { recursive: true });
+    return target;
 }
 
 class MonochromeClient {
